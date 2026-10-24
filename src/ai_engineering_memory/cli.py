@@ -446,9 +446,18 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     error_label = (
                         f" · ошибка {_safe_terminal_text(error)}" if error else ""
                     )
+                    instruction = details.get("learning_instruction_injected")
+                    instruction_label = ""
+                    if event == "UserPromptSubmit":
+                        instruction_state = (
+                            "enabled" if instruction is True
+                            else "not_added" if instruction is False
+                            else "unknown"
+                        )
+                        instruction_label = f" | learning_instruction={instruction_state}"
                     print(
                         f"  Последний запуск {event}: {timestamp} · {result} · "
-                        f"{source}{duration_label}{error_label}"
+                        f"{source}{duration_label}{instruction_label}{error_label}"
                     )
                 unavailable = [
                     event for event, available in hooks.get("launchers", {}).items()
