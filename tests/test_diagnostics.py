@@ -890,6 +890,28 @@ def test_hook_config_warns_when_launcher_path_is_missing(tmp_path):
     }
 
 
+def test_hook_status_message_mismatch_does_not_mark_launch_config_broken(tmp_path):
+    """A stale display label does not mean the hook command cannot run."""
+    config = tmp_path / "hooks.json"
+    _write_hook_config(config)
+    document = json.loads(config.read_text(encoding="utf-8"))
+    document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["statusMessage"] = (
+        "older display label"
+    )
+    config.write_text(json.dumps(document), encoding="utf-8")
+
+    result = diagnostics._hook_config_check(config)
+
+    assert result["status"] == "ok"
+    assert result["events"] == {"UserPromptSubmit": "ok", "Stop": "ok"}
+    assert result["metadata_mismatch_events"] == ["UserPromptSubmit"]
+    assert result["status_message_mismatch_events"] == ["UserPromptSubmit"]
+    assert result["handler_metadata"]["UserPromptSubmit"] == {
+        "timeout_matches_expected": True,
+        "status_message_matches_expected": False,
+    }
+
+
 def test_hook_config_warns_when_event_is_registered_more_than_once(tmp_path):
     """РџРѕРєР°Р·С‹РІР°РµС‚ РґСѓР±Р»РёСЂСѓСЋС‰РёРµСЃСЏ Р·Р°РїСѓСЃРєРё hook-Р° РІ РґРёР°РіРЅРѕСЃС‚РёРєРµ."""
     config = tmp_path / "hooks.json"
@@ -1029,7 +1051,8 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert "Последний запуск завершился ошибкой" not in output
     assert "последнего наблюдавшегося запуска" in output
     assert "не доказывает, что текущая настройка устарела" in output
-    assert "Параметры обработчиков требуют обновления: Stop" in output
+    assert "statusMessage" in output
+    assert "не мешает запуску" in output
     assert "hooks install --dry-run" in output
     assert "Область проекта MCP: рабочий каталог процесса MCP" in output
     assert "Знания: всего 1 · candidate=1" in output
