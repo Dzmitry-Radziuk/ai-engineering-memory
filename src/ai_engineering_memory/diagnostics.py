@@ -338,6 +338,11 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
                 "marker_present_unverified", "no_marker_seen",
             } else None,
             "duration_ms": duration_ms,
+            "learning_instruction_injected": (
+                record.get("learning_instruction_injected")
+                if isinstance(record.get("learning_instruction_injected"), bool)
+                else None
+            ),
             "error_type": (
                 record.get("error_type")
                 if isinstance(record.get("error_type"), str)
