@@ -260,10 +260,15 @@ def test_hook_log_records_only_whether_learning_instruction_was_added(
     codex_hooks.handle_event(
         "UserPromptSubmit", {"prompt": "Fix the retry bug and run pytest"}
     )
+    codex_hooks.handle_event(
+        "UserPromptSubmit", {"prompt": "Translate a short sentence"}
+    )
 
     log_text = (tmp_path / "hooks.jsonl").read_text(encoding="utf-8")
-    record = json.loads(log_text)
-    assert record["learning_instruction_injected"] is True
+    records = [json.loads(line) for line in log_text.splitlines()]
+    assert [record["learning_instruction_injected"] for record in records] == [
+        True, False,
+    ]
     assert "Fix the retry bug" not in log_text
     assert codex_hooks.LEARNING_CONTEXT not in log_text
 
