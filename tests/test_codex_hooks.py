@@ -506,3 +506,4 @@ def test_manifest_keeps_hooks_profile_scoped():
     assert manifest["version"] == "1.5.13"
     assert codex_hooks.HOOK_SOURCE == f"ai-engineering-memory:{manifest['version']}"
     assert manifest["extensions"]["com.openai"]["hooks"] == {}
+    assert not (root / "hooks" / "hooks.json").exists()
