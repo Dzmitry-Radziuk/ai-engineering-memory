@@ -111,6 +111,56 @@ def test_diagnostics_reports_missing_installation_without_creating_files(tmp_pat
     assert report["memory_mcp"]["status"] == "not_checked"
 
 
+def test_database_check_reports_lifecycle_counts_without_reading_record_content(tmp_path):
+    """Read-only diagnosis exposes lifecycle counts, never stored knowledge text."""
+    database = tmp_path / "memory-counts.db"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "CREATE TABLE knowledge "
+            "(id INTEGER PRIMARY KEY, namespace TEXT, status TEXT, title TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO knowledge(namespace, status, title) VALUES (?, ?, ?)",
+            [
+                ("global", "approved", "PRIVATE-APPROVED-TITLE"),
+                ("project:test", "candidate", "PRIVATE-CANDIDATE-TITLE"),
+            ],
+        )
+        connection.execute("CREATE TABLE task_events (event_id TEXT, status TEXT)")
+        connection.executemany(
+            "INSERT INTO task_events VALUES (?, ?)",
+            [("private-event-1", "pending_analysis"), ("private-event-2", "failed")],
+        )
+        connection.execute("CREATE TABLE verification_records (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO verification_records DEFAULT VALUES")
+        connection.execute(
+            "CREATE TABLE learning_corroborations (id INTEGER PRIMARY KEY)"
+        )
+    before = database.read_bytes()
+
+    report = diagnostics._database_check(database)
+
+    assert report["knowledge_counts"] == {
+        "total": 2,
+        "status_counts": {"approved": 1, "candidate": 1},
+    }
+    assert report["learning_counts"] == {
+        "task_events": {
+            "total": 2,
+            "status_counts": {"failed": 1, "pending_analysis": 1},
+        },
+        "verification_records": {"total": 1},
+        "learning_corroborations": {"total": 0},
+    }
+    serialized = json.dumps(report)
+    assert "PRIVATE-APPROVED-TITLE" not in serialized
+    assert "PRIVATE-CANDIDATE-TITLE" not in serialized
+    assert "private-event" not in serialized
+    assert database.read_bytes() == before
+
+
 def test_memory_mcp_check_reports_safe_launch_state_without_secrets(tmp_path):
     """Показывает известный MCP launcher, не раскрывая его env или аргументы."""
     config = tmp_path / "config.toml"

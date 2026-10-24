@@ -112,6 +112,55 @@ def _database_check(path: Path) -> dict[str, Any]:
                 ).fetchone()[0]
                 result["schema_version"] = version
 
+            tables = {
+                str(row[0]) for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "knowledge" in tables:
+                columns = {
+                    str(row[1]) for row in connection.execute(
+                        "PRAGMA table_info(knowledge)"
+                    )
+                }
+                if "status" in columns:
+                    counts = connection.execute(
+                        "SELECT status, COUNT(*) FROM knowledge "
+                        "GROUP BY status ORDER BY status"
+                    ).fetchall()
+                    status_counts = {str(row[0]): int(row[1]) for row in counts}
+                    result["knowledge_counts"] = {
+                        "total": sum(status_counts.values()),
+                        "status_counts": status_counts,
+                    }
+
+            learning_counts: dict[str, Any] = {}
+            for table in (
+                "task_events", "verification_records", "learning_corroborations",
+            ):
+                if table not in tables:
+                    continue
+                columns = {
+                    str(row[1]) for row in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    )
+                }
+                total = int(connection.execute(
+                    f"SELECT COUNT(*) FROM {table}"
+                ).fetchone()[0])
+                entry: dict[str, Any] = {"total": total}
+                if "status" in columns:
+                    counts = connection.execute(
+                        f"SELECT status, COUNT(*) FROM {table} "
+                        "GROUP BY status ORDER BY status"
+                    ).fetchall()
+                    entry["status_counts"] = {
+                        str(row[0]): int(row[1]) for row in counts
+                    }
+                learning_counts[table] = entry
+            if learning_counts:
+                result["learning_counts"] = learning_counts
+
         wal_stat = wal_path.stat() if wal_path.exists() else None
         wal_after = (wal_stat.st_size, wal_stat.st_mtime_ns) if wal_stat else None
         if wal_before != wal_after:
