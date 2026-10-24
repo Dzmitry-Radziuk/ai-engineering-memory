@@ -1,4 +1,4 @@
-""MCP stdio-адаптер к локальному ядру памяти."""
+"""MCP stdio-адаптер к локальному ядру памяти."""
 
 from __future__ import annotations
 

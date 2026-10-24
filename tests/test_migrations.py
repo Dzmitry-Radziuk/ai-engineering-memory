@@ -1,4 +1,4 @@
-""Regression fixtures for additive upgrades from legacy schema versions."""
+"""Regression fixtures for additive upgrades from legacy schema versions."""
 
 from __future__ import annotations
 

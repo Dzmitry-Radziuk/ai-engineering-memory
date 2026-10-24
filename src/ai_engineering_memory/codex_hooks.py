@@ -1,4 +1,4 @@
-""Адаптер командных lifecycle hooks Codex к локальному ядру памяти."""
+"""Адаптер командных lifecycle hooks Codex к локальному ядру памяти."""
 
 from __future__ import annotations
 

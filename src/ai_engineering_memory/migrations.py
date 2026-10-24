@@ -1,4 +1,4 @@
-""Repeatable, additive SQLite schema migrations."""
+"""Repeatable, additive SQLite schema migrations."""
 
 from __future__ import annotations
 

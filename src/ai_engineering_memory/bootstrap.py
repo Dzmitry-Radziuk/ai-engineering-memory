@@ -1,4 +1,4 @@
-""Composition root для CLI/MCP адаптеров локального приложения."""
+"""Composition root для CLI/MCP адаптеров локального приложения."""
 
 from __future__ import annotations
 

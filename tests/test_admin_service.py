@@ -1,4 +1,4 @@
-""Проверяет human-admin service и явное подтверждение CLI."""
+"""Проверяет human-admin service и явное подтверждение CLI."""
 
 from __future__ import annotations
 

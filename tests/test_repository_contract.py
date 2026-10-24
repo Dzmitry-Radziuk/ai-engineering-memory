@@ -1,4 +1,4 @@
-""Контракт application service и SQLite repository для памяти."""
+"""Контракт application service и SQLite repository для памяти."""
 
 from __future__ import annotations
 

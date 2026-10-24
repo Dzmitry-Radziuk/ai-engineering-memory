@@ -1,4 +1,4 @@
-""Изолированные проверки command hooks Codex."""
+"""Изолированные проверки command hooks Codex."""
 
 from __future__ import annotations
 
