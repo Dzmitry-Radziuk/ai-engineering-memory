@@ -440,7 +440,7 @@ def test_manifest_and_user_hook_template_are_consistent():
     root = Path(__file__).resolve().parents[1] / "plugins/ai-engineering-memory"
     manifest = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
     hooks = json.loads((root / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
-    assert manifest["version"] == "1.5.9"
+    assert manifest["version"] == "1.5.10"
     assert codex_hooks.HOOK_SOURCE == f"ai-engineering-memory:{manifest['version']}"
     assert manifest["extensions"]["com.openai"]["hooks"] == {}
     assert set(hooks) == {"UserPromptSubmit", "Stop"}

@@ -22,7 +22,7 @@ MAX_PROJECT_MEMORIES = 3
 MAX_PROMPT_SEARCH_CHARS = 10_000
 MAX_LOG_BYTES = 1_000_000
 HOOK_EVENTS = {"UserPromptSubmit", "Stop"}
-HOOK_SOURCE = "ai-engineering-memory:1.5.9"
+HOOK_SOURCE = "ai-engineering-memory:1.5.10"
 
 
 def _learning_context() -> str:
