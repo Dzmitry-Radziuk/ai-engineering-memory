@@ -26,14 +26,16 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install project and development tools
-        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+      - name: Install uv and locked development dependencies
+        run: |
+          python -m pip install --disable-pip-version-check "uv==0.11.13"
+          uv sync --locked --extra dev
       - name: Run Ruff
-        run: python -m ruff check .
+        run: uv run --locked ruff check .
       - name: Check Ruff formatting
-        run: python -m ruff format --check .
+        run: uv run --locked ruff format --check .
       - name: Run Mypy
-        run: python -m mypy
+        run: uv run --locked mypy
       - name: Run tests
         env:
           AI_MEMORY_DB: ${{ runner.temp }}/ai-engineering-memory-ci.sqlite
@@ -41,8 +43,8 @@ jobs:
           CODEX_HOME: ${{ runner.temp }}/codex-home
           COVERAGE_FILE: ${{ runner.temp }}/coverage
         run: |
-          python -m coverage run --source=ai_engineering_memory -m pytest -v --basetemp="${{ runner.temp }}/pytest"
-          python -m coverage report --fail-under=85
+          uv run --locked coverage run --source=ai_engineering_memory -m pytest -v --basetemp="${{ runner.temp }}/pytest"
+          uv run --locked coverage report --fail-under=85
 
   package:
     name: Build Python distributions
@@ -55,12 +57,13 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install build frontend
+      - name: Install uv and locked development dependencies
         run: |
           python -m pip install --disable-pip-version-check --upgrade "pip>=26.2.2"
-          python -m pip install --disable-pip-version-check build
+          python -m pip install --disable-pip-version-check "uv==0.11.13"
+          uv sync --locked --extra dev
       - name: Build wheel and source archive
-        run: python -m build --outdir "${{ runner.temp }}/dist"
+        run: uv run --locked python -m build --outdir "${{ runner.temp }}/dist"
       - name: Install wheel into isolated virtual environment
         run: |
           python -m venv "${{ runner.temp }}/wheel-smoke"
@@ -73,14 +76,12 @@ jobs:
         run: |
           "${{ runner.temp }}/wheel-smoke/bin/ai-memory" --help
           test ! -e "$AI_MEMORY_DB"
-      - name: Install pipx test frontend
-        run: python -m pip install --disable-pip-version-check "pipx==1.13.0"
       - name: Install wheel through pipx and smoke test CLI
         env:
           PIPX_HOME: ${{ runner.temp }}/pipx/home
           PIPX_BIN_DIR: ${{ runner.temp }}/pipx/bin
         run: |
-          python -m pipx install --python "$(python -c 'import sys; print(sys.executable)')" "${{ runner.temp }}/dist/"*.whl
+          uv run --locked python -m pipx install --python "$(python -c 'import sys; print(sys.executable)')" "${{ runner.temp }}/dist/"*.whl
           "${{ runner.temp }}/pipx/bin/ai-memory" --help
 
   dependency-audit:
@@ -94,9 +95,10 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install project and pinned audit tool
+      - name: Install uv and locked development dependencies
         run: |
           python -m pip install --disable-pip-version-check --upgrade "pip>=26.2.2"
-          python -m pip install --disable-pip-version-check -e ".[dev]" "pip-audit==2.10.1"
+          python -m pip install --disable-pip-version-check "uv==0.11.13"
+          uv sync --locked --extra dev
       - name: Audit installed dependencies
-        run: python -m pip_audit --local --disable-pip --cache-dir "${{ runner.temp }}/pip-audit-cache"
+        run: uv run --locked pip-audit --local --cache-dir "${{ runner.temp }}/pip-audit-cache"
