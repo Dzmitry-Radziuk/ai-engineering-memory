@@ -22,7 +22,7 @@ MAX_PROJECT_MEMORIES = 3
 MAX_PROMPT_SEARCH_CHARS = 10_000
 MAX_LOG_BYTES = 1_000_000
 HOOK_EVENTS = {"UserPromptSubmit", "Stop"}
-HOOK_SOURCE = "ai-engineering-memory:1.5.11"
+HOOK_SOURCE = "ai-engineering-memory:1.5.12"
 
 
 def _learning_context() -> str:
@@ -56,7 +56,8 @@ def _learning_context() -> str:
 
 LEARNING_CONTEXT = _learning_context()
 ENGINEERING_PROMPT = re.compile(
-    r"(?i)\b(code|bug|fix|implement|debug|refactor|build|create|develop|improve|"
+    r"(?i)\b(code|bug|fix|implement|update|add|remove|configure|migrate|optimize|"
+    r"write|debug|refactor|build|create|develop|improve|"
     r"automate|test|repo|file|function|class|module|integration|architecture|deploy|"
     r"review|audit|pytest|ruff|retry|"
     r"database|pipeline|endpoint|sql)\b|"
@@ -67,7 +68,8 @@ ENGINEERING_PROMPT = re.compile(
 )
 ENGINEERING_CONTEXT_PROMPT = re.compile(
     r"(?i)\b(code|bug|implement|debug|refactor|repo(?:sitory)?|file|function|class|"
-    r"module|integration|architecture|deploy|pytest|ruff|retry|database|pipeline|"
+    r"module|integration|architecture|deploy|docker|compose|container|kubernetes|"
+    r"k8s|terraform|ansible|nginx|github|gitlab|pytest|ruff|retry|database|pipeline|"
     r"endpoint|sql|engineering|workflow|software|application|api|service|bot|"
     r"configuration|security|script|mcp|telegram)\b|"
     r"(\u043a\u043e\u0434|\u043e\u0448\u0438\u0431|\u0440\u0435\u0430\u043b\u0438\u0437|"
