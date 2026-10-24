@@ -751,6 +751,24 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
         connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "CREATE TABLE knowledge "
+            "(id INTEGER PRIMARY KEY, namespace TEXT, status TEXT, title TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO knowledge(namespace, status, title) "
+            "VALUES ('global', 'candidate', 'PRIVATE-TITLE')"
+        )
+        connection.execute("CREATE TABLE task_events (event_id TEXT, status TEXT)")
+        connection.execute(
+            "INSERT INTO task_events VALUES ('PRIVATE-EVENT-ID', 'pending_analysis')"
+        )
+        connection.execute("CREATE TABLE verification_records (id INTEGER PRIMARY KEY)")
+        connection.execute("INSERT INTO verification_records DEFAULT VALUES")
+        connection.execute(
+            "CREATE TABLE learning_corroborations (id INTEGER PRIMARY KEY)"
+        )
+    before_database = database.read_bytes()
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
     hook_config = codex_home / "hooks.json"
@@ -793,6 +811,18 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     }
     assert report["hook_log"]["events"]["Stop"]["result"] == "marker_present_unverified"
     assert report["hook_log"]["stale_source_events"] == ["Stop"]
+    assert report["database"]["knowledge_counts"] == {
+        "total": 1,
+        "status_counts": {"candidate": 1},
+    }
+    assert report["database"]["learning_counts"] == {
+        "task_events": {
+            "total": 1,
+            "status_counts": {"pending_analysis": 1},
+        },
+        "verification_records": {"total": 1},
+        "learning_corroborations": {"total": 0},
+    }
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
     assert "not_exposed" in output
@@ -801,6 +831,9 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert "Параметры обработчиков требуют обновления: Stop" in output
     assert "hooks install --dry-run" in output
     assert "Область проекта MCP: рабочий каталог процесса MCP" in output
+    assert "Знания: всего 1 · candidate=1" in output
+    assert "Обучение: событий 1 (pending_analysis=1) · проверок 1" in output
+    assert "межпроектных подтверждений 0" in output
     assert "При смене workspace перезапустите MCP" in output
     assert "Stop не проверяет, запускалась ли" in output
     hook_log.write_text(json.dumps({
@@ -812,8 +845,4 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     }), encoding="utf-8")
     assert cli.main(["doctor"]) == 1
     assert "Stop отработал без маркера" in capsys.readouterr().out
-    with sqlite3.connect(database) as connection:
-        tables = connection.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
-        ).fetchone()[0]
-    assert tables == 1
+    assert database.read_bytes() == before_database

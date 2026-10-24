@@ -374,6 +374,44 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 )
                 if database.get("recommendation"):
                     print(f"  Рекомендация: {database['recommendation']}")
+                knowledge_counts = database.get("knowledge_counts")
+                if knowledge_counts is not None:
+                    status_counts = knowledge_counts.get("status_counts", {})
+                    status_summary = ", ".join(
+                        f"{_safe_terminal_text(status)}={count}"
+                        for status, count in sorted(status_counts.items())
+                    ) or "статусов пока нет"
+                    print(
+                        f"Знания: всего {knowledge_counts['total']} · "
+                        f"{status_summary}"
+                    )
+                elif database.get("integrity") == "skipped_active_wal":
+                    print(
+                        "Счётчики знаний пропущены: SQLite WAL активен, "
+                        "чтобы сохранить read-only проверку."
+                    )
+                learning_counts = database.get("learning_counts", {})
+                if learning_counts:
+                    task_events = learning_counts.get("task_events", {})
+                    task_status_counts = task_events.get("status_counts", {})
+                    task_status_summary = ", ".join(
+                        f"{_safe_terminal_text(status)}={count}"
+                        for status, count in sorted(task_status_counts.items())
+                    )
+                    task_total = task_events.get("total", 0)
+                    task_label = f"событий {task_total}"
+                    if task_status_summary:
+                        task_label += f" ({task_status_summary})"
+                    verifications = learning_counts.get(
+                        "verification_records", {},
+                    ).get("total", 0)
+                    corroborations = learning_counts.get(
+                        "learning_corroborations", {},
+                    ).get("total", 0)
+                    print(
+                        f"Обучение: {task_label} · проверок {verifications} · "
+                        f"межпроектных подтверждений {corroborations}"
+                    )
                 hooks = report["hooks"]
                 print(
                     f"Hooks: {labels[hooks['status']]} · "
