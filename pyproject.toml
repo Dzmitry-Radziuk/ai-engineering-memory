@@ -9,7 +9,7 @@ description = "Local AI engineering memory and skills management platform"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp>=1.30,<2",
+    "mcp>=1.30,<3",
 ]
 
 [project.optional-dependencies]
