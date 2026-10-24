@@ -466,11 +466,24 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 if unavailable:
                     print(f"  Не найден исполняемый файл для: {', '.join(unavailable)}")
                 metadata_mismatch = hooks.get("metadata_mismatch_events", [])
-                if metadata_mismatch:
-                    print(
-                        "  Параметры обработчиков требуют обновления: "
-                        + ", ".join(metadata_mismatch)
+                handler_metadata = hooks.get("handler_metadata", {})
+                timeout_mismatch = [
+                    event for event in metadata_mismatch
+                    if not handler_metadata.get(event, {}).get(
+                        "timeout_matches_expected", False
                     )
+                ]
+                status_message_mismatch = hooks.get(
+                    "status_message_mismatch_events", []
+                )
+                if timeout_mismatch:
+                    print(
+                        "  Таймауты hook-ов не совпадают для: "
+                        + ", ".join(timeout_mismatch)
+                    )
+                if status_message_mismatch:
+                    print("  Несовпадение statusMessage меняет только текст уведомления; оно не мешает запуску обработчика.")
+                if metadata_mismatch:
                     print(
                         "  Проверьте `.venv\\Scripts\\ai-memory.exe hooks install --dry-run`, "
                         "затем при необходимости выполните "
