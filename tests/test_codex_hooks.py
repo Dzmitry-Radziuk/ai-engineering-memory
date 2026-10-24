@@ -239,11 +239,17 @@ def test_engineering_prompt_gets_model_native_learning_instructions(isolated_db,
     context = output["hookSpecificOutput"]["additionalContext"]
     assert output["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "learning_add_candidate" in context
-    assert "--changed-file <relative-path>" in context
+    assert '--changed-file "<relative-path>"' in context
     assert "`verification:<id>`" in context
     assert "`file:<relative-path>`" in context
     assert "file-evidence" in context
     assert "не создавай candidate" in context
+    assert "--task-id <short-task-id>" in context
+    assert '--summary "<brief-redacted-summary>"' in context
+    assert '--cwd "<project-root>"' in context
+    assert "-- <actual-check-program> <args...>" in context
+    assert "Не запускай дополнительную проверку только ради памяти" in context
+    assert "Если подходящей проверки нет" in context
     assert "Fix the retry bug" not in context
 
 
