@@ -22,7 +22,7 @@ MAX_PROJECT_MEMORIES = 3
 MAX_PROMPT_SEARCH_CHARS = 10_000
 MAX_LOG_BYTES = 1_000_000
 HOOK_EVENTS = {"UserPromptSubmit", "Stop"}
-HOOK_SOURCE = "ai-engineering-memory:1.5.10"
+HOOK_SOURCE = "ai-engineering-memory:1.5.11"
 
 
 def _learning_context() -> str:
@@ -108,7 +108,8 @@ def _log_path() -> Path:
 
 
 def _write_log(event: str, result: str, duration_ms: int, *,
-               count: int = 0, error_type: str | None = None) -> None:
+               count: int = 0, error_type: str | None = None,
+               learning_instruction_injected: bool | None = None) -> None:
     """Добавляет безопасную запись о запуске и ограничивает размер журнала."""
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -117,6 +118,7 @@ def _write_log(event: str, result: str, duration_ms: int, *,
         "result": result,
         "duration_ms": duration_ms,
         "count": count,
+        "learning_instruction_injected": learning_instruction_injected,
         "error_type": error_type,
     }
     try:
@@ -136,11 +138,11 @@ def _write_log(event: str, result: str, duration_ms: int, *,
         pass
 
 
-def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
     """Ищет одобренные знания и резервирует контекст для текущего проекта."""
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        return {}, 0
+        return {}, 0, False
     search_prompt = prompt[:MAX_PROMPT_SEARCH_CHARS]
     memory_service = create_memory_service()
     global_rows = memory_service.search(
@@ -195,7 +197,11 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         and str(row.get("content", "")).strip()
     ]
     parts = []
-    if ENGINEERING_PROMPT.search(prompt) and ENGINEERING_CONTEXT_PROMPT.search(prompt):
+    learning_instruction_injected = bool(
+        ENGINEERING_PROMPT.search(prompt)
+        and ENGINEERING_CONTEXT_PROMPT.search(prompt)
+    )
+    if learning_instruction_injected:
         parts.append(LEARNING_CONTEXT)
     if memory_records:
         # JSON keeps record boundaries explicit; escaping markup prevents a memory
@@ -217,13 +223,13 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 break
             memory_records.pop()
     if not parts:
-        return {}, 0
+        return {}, 0, learning_instruction_injected
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": "\n\n".join(parts),
         }
-    }, len(memory_records)
+    }, len(memory_records), learning_instruction_injected
 
 
 def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -233,6 +239,7 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     result = "success"
     count = 0
+    learning_instruction_injected: bool | None = None
     error_type = None
     output: dict[str, Any] = {}
     try:
@@ -240,7 +247,7 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
         if supplied_event and supplied_event != event:
             raise ValueError("Hook event does not match payload")
         if event == "UserPromptSubmit":
-            output, count = _prompt_output(payload)
+            output, count, learning_instruction_injected = _prompt_output(payload)
         else:
             assistant_message = payload.get("last_assistant_message")
             marker_present = (
@@ -254,7 +261,10 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
         error_type = type(exc).__name__
     finally:
         duration_ms = round((time.perf_counter() - started) * 1000)
-        _write_log(event, result, duration_ms, count=count, error_type=error_type)
+        _write_log(
+            event, result, duration_ms, count=count, error_type=error_type,
+            learning_instruction_injected=learning_instruction_injected,
+        )
     return output
 
 
