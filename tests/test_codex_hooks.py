@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_engineering_memory import codex_hooks, storage
+from ai_engineering_memory import codex_hooks, hook_install, storage
 
 
 @pytest.fixture
@@ -515,4 +515,5 @@ def test_manifest_and_user_hook_template_are_consistent():
         assert handler["command"].endswith(
             f"-m ai_engineering_memory.codex_hooks {event}"
         )
+        assert handler["statusMessage"] == hook_install.HOOK_STATUS_MESSAGES[event]
         assert "args" not in handler
