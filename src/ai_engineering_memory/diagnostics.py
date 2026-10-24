@@ -195,6 +195,7 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
         "launcher_matches_current_interpreter": {},
         "handler_metadata": {},
         "metadata_mismatch_events": [],
+        "status_message_mismatch_events": [],
     }
     if not path.is_file():
         return result
@@ -257,6 +258,8 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
             "timeout_matches_expected": timeout_matches,
             "status_message_matches_expected": status_matches,
         }
+        if not status_matches:
+            result["status_message_mismatch_events"].append(event)
         if not timeout_matches or not status_matches:
             result["metadata_mismatch_events"].append(event)
 
@@ -264,7 +267,10 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
         "ok"
         if all(value == "ok" for value in result["events"].values())
         and all(result["launchers"].values())
-        and not result["metadata_mismatch_events"]
+        and all(
+            metadata["timeout_matches_expected"]
+            for metadata in result["handler_metadata"].values()
+        )
         else "warning"
     )
     return result
