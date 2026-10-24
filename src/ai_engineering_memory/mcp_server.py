@@ -26,9 +26,16 @@ class _JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         """Формирует строку лога с постоянными полями наблюдаемости."""
-        return json.dumps({"timestamp": datetime.now(UTC).isoformat(), "level": record.levelname,
-                           "component": record.name, "event": record.getMessage(),
-                           "correlation_id": getattr(record, "correlation_id", None)}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "level": record.levelname,
+                "component": record.name,
+                "event": record.getMessage(),
+                "correlation_id": getattr(record, "correlation_id", None),
+            },
+            ensure_ascii=False,
+        )
 
 
 _handler = logging.StreamHandler(sys.stderr)
@@ -69,15 +76,23 @@ def _require_allowed_namespace(namespace: str) -> None:
 def _require_visible_knowledge(knowledge_id: int) -> dict[str, Any]:
     """Возвращает запись только если она находится в доступном namespace."""
     record = _memory_service().get(knowledge_id)
-    if not isinstance(record, dict) or record.get("namespace") not in _allowed_memory_namespaces():
+    if (
+        not isinstance(record, dict)
+        or record.get("namespace") not in _allowed_memory_namespaces()
+    ):
         raise ValueError("Запись не найдена в доступном namespace")
     return record
 
 
 @server.tool()
-def memory_search(query: str, namespace: str = "global", status: str | None = "approved",
-                  category: str | None = None, limit: int = 10,
-                  prompt_context: bool = False) -> list[dict[str, Any]]:
+def memory_search(
+    query: str,
+    namespace: str = "global",
+    status: str | None = "approved",
+    category: str | None = None,
+    limit: int = 10,
+    prompt_context: bool = False,
+) -> list[dict[str, Any]]:
     """Ищет знания; namespace — фильтр выдачи, а не граница доступа.
 
     Для текущей задачи используй только global и namespace текущего проекта;
@@ -108,12 +123,22 @@ def memory_overview(namespace: str | None = None) -> dict[str, Any]:
 def memory_get(knowledge_id: int) -> dict[str, Any] | None:
     """Возвращает запись памяти по локальному числовому ID."""
     result = _memory_service().get(knowledge_id)
-    return result if isinstance(result, dict) and result.get("namespace") in _allowed_memory_namespaces() else None
+    return (
+        result
+        if isinstance(result, dict)
+        and result.get("namespace") in _allowed_memory_namespaces()
+        else None
+    )
 
 
 @server.tool()
-def memory_add_candidate(category: str, title: str, content: str, namespace: str = "global",
-                         technology: str = "") -> dict[str, Any]:
+def memory_add_candidate(
+    category: str,
+    title: str,
+    content: str,
+    namespace: str = "global",
+    technology: str = "",
+) -> dict[str, Any]:
     """Добавляет неподтверждённого кандидата без публикации данных наружу."""
     _require_allowed_namespace(namespace)
     return _memory_service().create_candidate(
@@ -126,14 +151,12 @@ def memory_add_candidate(category: str, title: str, content: str, namespace: str
 
 
 @server.tool()
-def memory_list_candidates(namespace: str = "global", limit: int = 100) -> list[dict[str, Any]]:
+def memory_list_candidates(
+    namespace: str = "global", limit: int = 100
+) -> list[dict[str, Any]]:
     """Показывает кандидатов в выбранном пространстве имён."""
     _require_allowed_namespace(namespace)
     return _memory_service().list_candidates(namespace=namespace, limit=limit)
-
-
-
-
 
 
 @server.tool()
@@ -149,10 +172,15 @@ def skills_get(name: str) -> dict[str, Any]:
 
 
 @server.tool()
-def skills_propose_update(skill_name: str, proposer: str, description: str, content: str) -> dict[str, str]:
+def skills_propose_update(
+    skill_name: str, proposer: str, description: str, content: str
+) -> dict[str, str]:
     """Сохраняет проверенное предложение отдельно от активного Skill."""
     return create_skills_service().propose_update(
-        skill_name, proposer, description, content,
+        skill_name,
+        proposer,
+        description,
+        content,
     )
 
 
@@ -168,16 +196,10 @@ def skills_get_proposal(proposal_id: str) -> dict[str, Any]:
     return create_skills_service().get_proposal(proposal_id)
 
 
-
-
-
-
 @server.tool()
 def skills_get_history(skill_name: str) -> list[dict[str, Any]]:
     """Показывает историю утверждённых версий Skill."""
     return create_skills_service().get_history(skill_name)
-
-
 
 
 @server.tool()
@@ -193,25 +215,43 @@ def learning_submit_task(event_json: str) -> dict[str, Any]:
         raise ValueError("Learning event должен относиться к текущему проекту")
     _require_allowed_namespace(project_id)
     return create_learning_service().ingest_task_event(
-        event, allowed_namespaces=tuple(_allowed_memory_namespaces()),
+        event,
+        allowed_namespaces=tuple(_allowed_memory_namespaces()),
     )
 
 
 @server.tool()
 def learning_add_candidate(
-    verification_id: str, title: str, category: str, summary: str,
-    problem: str, root_cause: str, solution: str, conditions: str,
-    limitations: str, verification_summary: str, evidence_refs: list[str],
-    confidence: str, confidence_basis: str,
+    verification_id: str,
+    title: str,
+    category: str,
+    summary: str,
+    problem: str,
+    root_cause: str,
+    solution: str,
+    conditions: str,
+    limitations: str,
+    verification_summary: str,
+    evidence_refs: list[str],
+    confidence: str,
+    confidence_basis: str,
 ) -> dict[str, Any]:
     """Сохраняет project candidate; global-подтверждение требует file-ссылки из verifier."""
     return create_learning_service().capture_candidate(
         allowed_namespaces=tuple(_allowed_memory_namespaces()),
-        verification_id=verification_id, title=title, category=category,
-        summary=summary, problem=problem, root_cause=root_cause,
-        solution=solution, conditions=conditions, limitations=limitations,
-        verification_summary=verification_summary, evidence_refs=evidence_refs,
-        confidence=confidence, confidence_basis=confidence_basis,
+        verification_id=verification_id,
+        title=title,
+        category=category,
+        summary=summary,
+        problem=problem,
+        root_cause=root_cause,
+        solution=solution,
+        conditions=conditions,
+        limitations=limitations,
+        verification_summary=verification_summary,
+        evidence_refs=evidence_refs,
+        confidence=confidence,
+        confidence_basis=confidence_basis,
     )
 
 
@@ -226,7 +266,8 @@ def learning_get_corroboration(knowledge_id: int) -> dict[str, Any]:
 def learning_get_status(event_id: str) -> dict[str, Any] | None:
     """Возвращает состояние обработки сохранённого события."""
     return create_learning_service().get_task_status(
-        event_id, allowed_namespaces=tuple(_allowed_memory_namespaces()),
+        event_id,
+        allowed_namespaces=tuple(_allowed_memory_namespaces()),
     )
 
 

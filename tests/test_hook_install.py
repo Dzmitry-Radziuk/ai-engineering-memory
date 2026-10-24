@@ -14,17 +14,21 @@ def test_install_merges_hooks_and_backs_up_existing_config(tmp_path):
     original = {
         "custom_setting": {"enabled": True},
         "hooks": {
-            "UserPromptSubmit": [{"hooks": [
-                {"type": "command", "command": "echo user-hook"},
+            "UserPromptSubmit": [
                 {
-                    "type": "command",
-                    "command": "C:\\old\\python.exe -m ai_engineering_memory.codex_hooks UserPromptSubmit",
-                },
-                {
-                    "type": "command",
-                    "command": "D:\\old\\python.exe -m ai_engineering_memory.codex_hooks UserPromptSubmit",
-                },
-            ]}],
+                    "hooks": [
+                        {"type": "command", "command": "echo user-hook"},
+                        {
+                            "type": "command",
+                            "command": "C:\\old\\python.exe -m ai_engineering_memory.codex_hooks UserPromptSubmit",
+                        },
+                        {
+                            "type": "command",
+                            "command": "D:\\old\\python.exe -m ai_engineering_memory.codex_hooks UserPromptSubmit",
+                        },
+                    ]
+                }
+            ],
         },
     }
     config.write_text(json.dumps(original), encoding="utf-8")
@@ -46,7 +50,8 @@ def test_install_merges_hooks_and_backs_up_existing_config(tmp_path):
     ]
     assert prompt_commands.count("echo user-hook") == 1
     installed_prompt = [
-        command for command in prompt_commands
+        command
+        for command in prompt_commands
         if "-m ai_engineering_memory.codex_hooks UserPromptSubmit" in command
     ]
     assert len(installed_prompt) == 1
@@ -74,16 +79,31 @@ def test_install_repairs_existing_memory_hook_timeout_and_status(tmp_path):
     executable = str(tmp_path / "python.exe")
     document = {
         "hooks": {
-            event: [{"hooks": [{
-                "type": "command",
-                "command": hook_install._command_for_event(event, executable),
-            }]}]
+            event: [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_install._command_for_event(
+                                event, executable
+                            ),
+                        }
+                    ]
+                }
+            ]
             for event in hook_install.HOOK_EVENTS
         }
     }
-    document["hooks"]["UserPromptSubmit"].append({"hooks": [{
-        "type": "command", "command": "echo preserve user hook",
-    }]})
+    document["hooks"]["UserPromptSubmit"].append(
+        {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "echo preserve user hook",
+                }
+            ]
+        }
+    )
     config.write_text(json.dumps(document), encoding="utf-8")
 
     result = hook_install.install_hooks(config, executable=executable)
@@ -120,12 +140,20 @@ def test_dry_run_reports_field_names_without_config_values(tmp_path):
     executable = str(tmp_path / "python.exe")
     original = {
         "hooks": {
-            event: [{"hooks": [{
-                "type": "command",
-                "command": hook_install._command_for_event(event, executable),
-                "timeout": hook_install.HOOK_TIMEOUT_SECONDS,
-                "statusMessage": f"private legacy status for {event}",
-            }]}]
+            event: [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_install._command_for_event(
+                                event, executable
+                            ),
+                            "timeout": hook_install.HOOK_TIMEOUT_SECONDS,
+                            "statusMessage": f"private legacy status for {event}",
+                        }
+                    ]
+                }
+            ]
             for event in hook_install.HOOK_EVENTS
         }
     }
@@ -133,7 +161,9 @@ def test_dry_run_reports_field_names_without_config_values(tmp_path):
     before = config.read_bytes()
 
     result = hook_install.install_hooks(
-        config, executable=executable, dry_run=True,
+        config,
+        executable=executable,
+        dry_run=True,
     )
 
     assert result["changed"] is True

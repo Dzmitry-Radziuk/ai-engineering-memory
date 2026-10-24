@@ -4,20 +4,20 @@
 
 Коротко о работе: Codex получает подходящие `approved` знания через hook; новый урок при наличии сначала становится `candidate`; межпроектное подтверждение может создать global candidate; человек решает, что одобрить. Кандидаты не попадают в обычные подсказки, а Skills и проекты автоматически не меняются.
 
-Начните с [простого руководства пользователя](docs/usage.md). Архитектура, безопасность, жизненный цикл знаний и интеграция Codex описаны в [проектной документации](docs/architecture.md), [безопасности](docs/security.md), [цикле знаний](docs/knowledge-lifecycle.md) и [интеграции](docs/codex-integration.md).
+Начните с [простого руководства пользователя](docs/usage.md). Архитектура, безопасность, жизненный цикл знаний и интеграция Codex описаны в [проектной документации](docs/architecture.md), [безопасности](docs/security.md), [цикле знаний](docs/knowledge-lifecycle.md), [интеграции](docs/codex-integration.md) и [модели версий](docs/versioning.md).
 
 ## Установка
 
 ```powershell
 py -3.14 -m venv .venv
 .venv\Scripts\python.exe -m pip install -e ".[dev]"
-.venv\Scripts\ai-memory.exe init
+.venv\Scripts\ai-memory.exe setup
 .venv\Scripts\ai-memory.exe status
 ```
 
-Если рядом с установленным пакетом уже есть `data/memory.db`, используется эта абсолютная база; иначе Windows-путь по умолчанию — `%LOCALAPPDATA%\AIEngineeringMemory\memory.db`. Поэтому открытие другого проекта не переключает базу. `AI_MEMORY_DB` переопределяет путь только если он абсолютный. Существующие целочисленные ID сохраняются при расширении схемы.
+Если рядом с установленным пакетом уже есть `data/memory.db`, используется эта абсолютная база; иначе Windows-путь по умолчанию — `%LOCALAPPDATA%\AIEngineeringMemory\memory.db`. Поэтому открытие другого проекта само по себе не переключает базу. При необходимости отдельного хранилища задайте `AI_MEMORY_PROFILE`; `ai-memory profile show/list` показывают выбор и созданные профили. `AI_MEMORY_DB` переопределяет оба варианта, если он абсолютный. Существующие целочисленные ID сохраняются при расширении схемы.
 
-Для read-only проверки базы, пользовательской регистрации hooks и последних результатов запустите:
+Для read-only проверки базы, пользовательской регистрации hooks и последних результатов:
 
 ```powershell
 .venv\Scripts\ai-memory.exe doctor
@@ -41,6 +41,8 @@ Dry-run перечисляет изменяемые события и назва
 Команда проверяет целостность существующей SQLite-базы, версию схемы, наличие и количество команд `UserPromptSubmit` и `Stop` в `hooks.json`, предупреждает о повторной регистрации и проверяет доступность указанных исполняемых файлов. Она также показывает краткие метаданные последних записей журнала. Обычный `doctor` не создаёт и не мигрирует базу, не запускает hooks или MCP-сервер и не выводит prompts или ответы. `CODEX_HOME` учитывается при выборе каталога профиля; при его отсутствии используется `%USERPROFILE%\.codex`.
 
 Для дополнительной проверки используйте `.venv\Scripts\ai-memory.exe doctor --probe-mcp`. Probe запускает только распознанную команду AI Engineering Memory, проверяет MCP `initialize` и `tools/list`, затем вызывает read-only `memory_search` на временной пустой БД. Путь БД из конфигурации заменяется только для probe-процесса; основная база не используется. Значения окружения из MCP-конфига передаются дочернему процессу, но не выводятся. Это проверяет запуск и фактический вызов инструмента из процесса `doctor`, но не подтверждает runtime или рабочий каталог MCP внутри Codex и не проверяет содержимое основной базы.
+
+Локальные измерения поиска, hook, записи, инициализации и backup/restore на временных наборах данных описаны в [bench/README.md](bench/README.md).
 
 Для результата `Stop` `no_marker_seen` означает только, что маркера не было во входном сообщении; `marker_present_unverified` означает, что маркер был, но сам hook не проверяет запуск или результат команды. Ни один из этих результатов не подтверждает успешное выполнение задачи.
 
@@ -118,14 +120,21 @@ MCP использует stdio. Инструкции по настройке и 
 
 ## Проверки
 
-GitHub Actions запускает Ruff и полный набор тестов на Ubuntu и Windows с Python
-3.12, 3.13 и 3.14, а также собирает wheel и исходный архив и проверяет установленную
-команду CLI. Проверки используют временные пути runner, не подключаясь к пользовательской базе знаний. Workflow
+Сторонние search, analyzer, importer и exporter расширения описаны в
+[руководстве по plugin SPI](docs/plugins.md). Ядро не загружает их автоматически;
+необязательный search backend выбирается только через `AI_MEMORY_SEARCH_PLUGIN`.
+
+GitHub Actions запускает Ruff, Mypy и полный набор тестов на Ubuntu, Windows и macOS с Python
+3.12, 3.13 и 3.14, аудит зависимостей, а также собирает wheel и исходный архив и проверяет установленную
+команду CLI в чистом venv и через pipx. Проверки используют временные пути runner, не подключаясь к пользовательской базе знаний. Workflow
 запускается при push в `main`, pull request или вручную.
 
 ```powershell
 .venv\Scripts\python.exe -m ruff check .
-.venv\Scripts\python.exe -m pytest -v --basetemp="$env:TEMP\ai-memory-pytest"
+.venv\Scripts\python.exe -m mypy
+$env:COVERAGE_FILE = Join-Path $env:TEMP 'ai-memory-coverage'
+.venv\Scripts\python.exe -m coverage run --source=ai_engineering_memory -m pytest -v --basetemp="$env:TEMP\ai-memory-pytest"
+.venv\Scripts\python.exe -m coverage report
 ```
 
 Тесты используют отдельные временные SQLite-файлы. Основная база не нужна для тестового прогона.

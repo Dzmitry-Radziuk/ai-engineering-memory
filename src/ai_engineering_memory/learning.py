@@ -18,6 +18,11 @@ from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 from ai_engineering_memory import storage
+from ai_engineering_memory.ports import LearningAnalysisProvider
+from ai_engineering_memory.privacy import (
+    contains_sensitive_secret,
+    contains_sensitive_text,
+)
 
 MAX_EVENT_TEXT = 2_000
 MAX_PROVIDER_RESPONSE = 64_000
@@ -44,9 +49,10 @@ class OllamaProvider:
         if parsed.scheme != "http" or not parsed.hostname or not parsed.port:
             raise ProviderError("InvalidLocalProviderConfig")
         try:
-            local_host = parsed.hostname == "localhost" or ipaddress.ip_address(
-                parsed.hostname
-            ).is_loopback
+            local_host = (
+                parsed.hostname == "localhost"
+                or ipaddress.ip_address(parsed.hostname).is_loopback
+            )
         except ValueError:
             local_host = False
         if not local_host or parsed.username or parsed.password or not model.strip():
@@ -78,14 +84,16 @@ class OllamaProvider:
             "confidence": "low|medium|high",
             "confidence_basis": "string",
         }
-        request_body = json.dumps({
-            "model": self.model,
-            "system": system,
-            "prompt": f"Untrusted event data:\n{user}\n\nRequired JSON schema:\n{json.dumps(schema)}",
-            "stream": False,
-            "format": "json",
-            "options": {"num_predict": 900},
-        }).encode("utf-8")
+        request_body = json.dumps(
+            {
+                "model": self.model,
+                "system": system,
+                "prompt": f"Untrusted event data:\n{user}\n\nRequired JSON schema:\n{json.dumps(schema)}",
+                "stream": False,
+                "format": "json",
+                "options": {"num_predict": 900},
+            }
+        ).encode("utf-8")
         request = Request(
             self.endpoint,
             data=request_body,
@@ -153,7 +161,8 @@ def _path_identity_text(path: Path, *, case_sensitive: bool | None = None) -> st
     for part in path.parts[1:]:
         try:
             matches = [
-                entry.name for entry in current.iterdir()
+                entry.name
+                for entry in current.iterdir()
                 if entry.name.casefold() == part.casefold()
             ]
         except OSError:
@@ -169,8 +178,14 @@ def _git_repository_root(cwd: Path) -> Path:
     try:
         result = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return cwd
@@ -189,8 +204,14 @@ def _git_changed_files(cwd: Path, files: Sequence[str]) -> list[str]:
     try:
         root_result = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
         )
         if root_result.returncode != 0 or not root_result.stdout.strip():
             return []
@@ -202,11 +223,24 @@ def _git_changed_files(cwd: Path, files: Sequence[str]) -> list[str]:
         pathspecs = [":(top,literal)" + name for name in repository_paths]
         result = subprocess.run(
             [
-                "git", "-C", str(cwd), "status", "--porcelain=v1", "-z",
-                "--untracked-files=all", "--", *pathspecs,
+                "git",
+                "-C",
+                str(cwd),
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--",
+                *pathspecs,
             ],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
         )
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return []
@@ -233,7 +267,8 @@ def _git_changed_files(cwd: Path, files: Sequence[str]) -> list[str]:
     normalize = str.casefold if os.name == "nt" else (lambda value: value)
     changed_keys = {normalize(path) for path in changed}
     return [
-        name for name, repository_path in zip(files, repository_paths, strict=True)
+        name
+        for name, repository_path in zip(files, repository_paths, strict=True)
         if normalize(repository_path) in changed_keys
     ]
 
@@ -252,10 +287,12 @@ def _canonical_git_origin(remote: str, repository_root: Path) -> str | None:
         if path:
             host = parsed.hostname.casefold()
             try:
-                if parsed.port:
-                    host = f"{host}:{parsed.port}"
+                port = parsed.port
             except ValueError:
                 return None
+            default_ports = {"http": 80, "https": 443, "ssh": 22, "git": 9418}
+            if port is not None and port != default_ports.get(parsed.scheme.casefold()):
+                host = f"{host}:{port}"
             return f"remote:{host}/{path}"
     scp_match = re.fullmatch(r"(?:[^@/]+@)?([^/:]+):(.+)", value)
     if scp_match:
@@ -277,8 +314,14 @@ def _git_origin_identity(repository_root: Path) -> str | None:
     try:
         result = subprocess.run(
             ["git", "-C", str(repository_root), "remote", "get-url", "origin"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", timeout=2, check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -294,8 +337,8 @@ def project_fingerprint(cwd: str | Path) -> str | None:
     identity = _git_origin_identity(repository_root)
     if identity is None:
         return None
-    digest = hashlib.sha256(("project-origin-v2\0" + identity).encode("utf-8"))
-    return "origin-v2:" + digest.hexdigest()
+    digest = hashlib.sha256(("project-origin-v3\0" + identity).encode("utf-8"))
+    return "origin-v3:" + digest.hexdigest()
 
 
 def _redact_summary(summary: str) -> str:
@@ -305,25 +348,38 @@ def _redact_summary(summary: str) -> str:
     value = summary.strip()[:MAX_EVENT_TEXT]
     value = re.sub(
         r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+",
-        r"\1=[redacted]", value,
+        r"\1=[redacted]",
+        value,
     )
     value = re.sub(r"(?i)\bbearer\s+\S+", "Bearer [redacted]", value)
-    if storage._contains_sensitive_secret(value):
-        raise storage.StorageError("Описание задачи содержит возможные приватные данные")
+    if contains_sensitive_secret(value):
+        raise storage.StorageError(
+            "Описание задачи содержит возможные приватные данные"
+        )
     value = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[email]", value)
     value = re.sub(r"(?i)https?://[^\s<>()]+", "[url]", value)
     value = re.sub(r"(?i)(?:[A-Z]:\\|/)(?:[^\s,;]+[\\/])*[^\s,;]+", "[path]", value)
     if storage._contains_sensitive_text(value):
-        raise storage.StorageError("Описание задачи содержит возможные приватные данные")
+        raise storage.StorageError(
+            "Описание задачи содержит возможные приватные данные"
+        )
     return value.strip()
 
 
-def verify_command(task_id: str, summary: str, command: Sequence[str], *,
-                   cwd: str | Path, timeout: int = 300,
-                   changed_files: Sequence[str] = ()) -> dict[str, Any]:
+def verify_command(
+    task_id: str,
+    summary: str,
+    command: Sequence[str],
+    *,
+    cwd: str | Path,
+    timeout: int = 300,
+    changed_files: Sequence[str] = (),
+) -> dict[str, Any]:
     """Запускает проверку и принимает только существующие файлы внутри проекта."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", task_id):
-        raise storage.StorageError("task_id должен содержать только буквы, цифры, точку, дефис и _")
+        raise storage.StorageError(
+            "task_id должен содержать только буквы, цифры, точку, дефис и _"
+        )
     if storage._contains_sensitive_text(task_id):
         raise storage.StorageError("task_id содержит возможные приватные данные")
     safe_summary = _redact_summary(summary)
@@ -337,12 +393,18 @@ def verify_command(task_id: str, summary: str, command: Sequence[str], *,
     safe_files: list[str] = []
     for name in changed_files:
         if not isinstance(name, str) or not name.strip():
-            raise storage.StorageError("changed_files принимает только относительные пути файлов")
+            raise storage.StorageError(
+                "changed_files принимает только относительные пути файлов"
+            )
         if storage._contains_sensitive_text(name.replace("/", "\\")):
-            raise storage.StorageError("Путь changed_files содержит возможные приватные данные")
+            raise storage.StorageError(
+                "Путь changed_files содержит возможные приватные данные"
+            )
         candidate = Path(name)
         if candidate.is_absolute() or ".." in candidate.parts:
-            raise storage.StorageError("changed_files принимает только относительные пути")
+            raise storage.StorageError(
+                "changed_files принимает только относительные пути"
+            )
         try:
             resolved_file = (root / candidate).resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -368,11 +430,20 @@ def verify_command(task_id: str, summary: str, command: Sequence[str], *,
     started_text = started.isoformat()
     timed_out = False
     launch_failed = False
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+    with (
+        tempfile.TemporaryFile() as stdout_file,
+        tempfile.TemporaryFile() as stderr_file,
+    ):
         try:
             result = subprocess.run(
-                argv, cwd=root, stdin=subprocess.DEVNULL, stdout=stdout_file,
-                stderr=stderr_file, shell=False, timeout=timeout, check=False,
+                argv,
+                cwd=root,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                shell=False,
+                timeout=timeout,
+                check=False,
             )
         except subprocess.TimeoutExpired:
             timed_out = True
@@ -413,8 +484,11 @@ def verify_command(task_id: str, summary: str, command: Sequence[str], *,
             "exit_code": verification["exit_code"],
             "verification_type": verification["verification_type"],
             "error_type": (
-                "CommandLaunchError" if launch_failed
-                else "VerificationTimeout" if timed_out else None
+                "CommandLaunchError"
+                if launch_failed
+                else "VerificationTimeout"
+                if timed_out
+                else None
             ),
         }
     event_id = hashlib.sha256(
@@ -448,72 +522,103 @@ def verify_command(task_id: str, summary: str, command: Sequence[str], *,
 
 
 def _validate_codex_candidate_text(field: str, value: str, maximum: int) -> str:
-    """Ограничивает содержимое кандидата и отвергает частые утечки данных."""
+    """Проверяет размер и приватность текста перед сохранением кандидата."""
     if not isinstance(value, str):
         raise storage.StorageError(f"{field} должен быть строкой")
     cleaned = value.strip()
     if not cleaned or len(cleaned) > maximum or "\x00" in cleaned:
         raise storage.StorageError(f"Некорректная длина поля {field}")
-    sensitive_patterns = (
-        r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+",
-        r"(?i)\bbearer\s+\S+",
-        r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-        r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
-        r"(?i)(?:[A-Z]:\\|/)(?:[^\s,;]+[\\/])*[^\s,;]+",
-    )
-    if any(re.search(pattern, cleaned) for pattern in sensitive_patterns):
-        raise storage.StorageError(f"Поле {field} содержит запрещённые приватные данные")
+    if contains_sensitive_text(cleaned):
+        raise storage.StorageError(
+            f"Поле {field} содержит запрещённые приватные данные"
+        )
     if "```" in cleaned:
-        raise storage.StorageError("Передавайте вывод решения, а не блоки исходного кода")
+        raise storage.StorageError(
+            "Передавайте вывод решения, а не блоки исходного кода"
+        )
     return cleaned
 
 
 def submit_codex_candidate(
-    *, verification_id: str, title: str, category: str, summary: str,
-    problem: str, root_cause: str, solution: str, conditions: str,
-    limitations: str, verification_summary: str, evidence_refs: list[str],
-    confidence: str, confidence_basis: str,
+    *,
+    verification_id: str,
+    title: str,
+    category: str,
+    summary: str,
+    problem: str,
+    root_cause: str,
+    solution: str,
+    conditions: str,
+    limitations: str,
+    verification_summary: str,
+    evidence_refs: list[str],
+    confidence: str,
+    confidence_basis: str,
 ) -> dict[str, Any]:
     """Сохраняет структурированный вывод Codex после доверенной проверки."""
-    if not isinstance(verification_id, str) or not re.fullmatch(r"[a-f0-9]{64}", verification_id):
+    if not isinstance(verification_id, str) or not re.fullmatch(
+        r"[a-f0-9]{64}", verification_id
+    ):
         raise storage.StorageError("Некорректный verification_id")
     event = storage.get_learning_event_by_verification(verification_id)
     if not event:
-        raise storage.StorageError("Для verification_id нет события локального verifier")
+        raise storage.StorageError(
+            "Для verification_id нет события локального verifier"
+        )
     namespace = project_namespace_from_id(event["project_id"])
-    if event["status"] not in {"pending_analysis", "retryable_error", "candidate_created", "no_insight"}:
+    if event["status"] not in {
+        "pending_analysis",
+        "retryable_error",
+        "candidate_created",
+        "no_insight",
+    }:
         raise storage.StorageError("Событие не ожидает анализа")
 
     limits = {
-        "title": (title, 200), "category": (category, 40),
-        "summary": (summary, 300), "problem": (problem, 400),
-        "root_cause": (root_cause, 400), "solution": (solution, 500),
-        "conditions": (conditions, 300), "limitations": (limitations, 300),
+        "title": (title, 200),
+        "category": (category, 40),
+        "summary": (summary, 300),
+        "problem": (problem, 400),
+        "root_cause": (root_cause, 400),
+        "solution": (solution, 500),
+        "conditions": (conditions, 300),
+        "limitations": (limitations, 300),
         "verification_summary": (verification_summary, 300),
         "confidence_basis": (confidence_basis, 200),
     }
-    clean = {name: _validate_codex_candidate_text(name, value, maximum)
-             for name, (value, maximum) in limits.items()}
+    clean = {
+        name: _validate_codex_candidate_text(name, value, maximum)
+        for name, (value, maximum) in limits.items()
+    }
     if not re.fullmatch(r"[a-z][a-z0-9_]{1,39}", clean["category"]):
-        raise storage.StorageError("category должна быть коротким lowercase идентификатором")
+        raise storage.StorageError(
+            "category должна быть коротким lowercase идентификатором"
+        )
     if confidence not in {"low", "medium", "high"}:
         raise storage.StorageError("confidence должна быть low, medium или high")
     if not isinstance(evidence_refs, list) or len(evidence_refs) > 8:
         raise storage.StorageError("evidence_refs должен содержать от 1 до 8 ссылок")
-    if len(_tokens(" ".join(clean[key] for key in ("summary", "problem", "solution")))) < 10:
+    if (
+        len(_tokens(" ".join(clean[key] for key in ("summary", "problem", "solution"))))
+        < 10
+    ):
         raise storage.StorageError("Вывод слишком общий для инженерного кандидата")
 
     # The verifier checks recorded file refs for existence and project containment, not modification.
     expected_ref = f"verification:{verification_id}"
     if expected_ref not in evidence_refs:
-        raise storage.StorageError("evidence_refs должен содержать точную verification-ссылку")
+        raise storage.StorageError(
+            "evidence_refs должен содержать точную verification-ссылку"
+        )
     for reference in evidence_refs:
         if not isinstance(reference, str) or len(reference) > 300:
             raise storage.StorageError("Некорректная ссылка evidence")
         if reference.startswith("verification:") and reference != expected_ref:
             raise storage.StorageError("Ссылка на другую проверку запрещена")
         if not reference.startswith(("verification:", "file:")):
-            raise storage.StorageError("Разрешены только verification ID и проверенные changed files")
+            raise storage.StorageError(
+                "Разрешены только verification ID и проверенные changed files"
+            )
 
     content = (
         f"Краткий вывод: {clean['summary']}\n\nПроблема: {clean['problem']}\n\n"
@@ -528,15 +633,22 @@ def submit_codex_candidate(
     if len(content) > 3_500:
         raise storage.StorageError("Суммарный вывод превышает допустимый размер")
     structured = {
-        **clean, "verification_id": verification_id, "project_namespace": namespace,
-        "evidence_refs": evidence_refs, "confidence": confidence,
+        **clean,
+        "verification_id": verification_id,
+        "project_namespace": namespace,
+        "evidence_refs": evidence_refs,
+        "confidence": confidence,
         "provenance": "codex_model_after_local_verifier",
     }
     confidence_score = {"low": 0.35, "medium": 0.6, "high": 0.8}[confidence]
     return storage.create_codex_learning_candidate(
-        verification_id=verification_id, category=clean["category"],
-        title=clean["title"], content=content, rationale=clean["verification_summary"],
-        limitations=clean["limitations"], confidence=confidence_score,
+        verification_id=verification_id,
+        category=clean["category"],
+        title=clean["title"],
+        content=content,
+        rationale=clean["verification_summary"],
+        limitations=clean["limitations"],
+        confidence=confidence_score,
         evidence_refs=evidence_refs,
         analysis_json=json.dumps(structured, ensure_ascii=False, sort_keys=True),
     )
@@ -548,16 +660,28 @@ def _tokens(value: str) -> set[str]:
 
 
 def _validate_analysis(result: dict[str, Any], verification_id: str) -> dict[str, Any]:
-    """Проверяет строгую структуру, объём и ссылку на реальное доказательство."""
+    """Проверяет формат, доказательство и приватность ответа анализатора."""
     fields = {
-        "should_store", "title", "lesson", "category", "applicability",
-        "rationale", "evidence_refs", "limitations", "confidence", "confidence_basis",
+        "should_store",
+        "title",
+        "lesson",
+        "category",
+        "applicability",
+        "rationale",
+        "evidence_refs",
+        "limitations",
+        "confidence",
+        "confidence_basis",
     }
     if set(result) != fields or not isinstance(result.get("should_store"), bool):
         raise ProviderError("InvalidAnalysisSchema")
     limits = {
-        "title": 200, "lesson": 1200, "category": 100,
-        "applicability": 500, "rationale": 800, "limitations": 500,
+        "title": 200,
+        "lesson": 1200,
+        "category": 100,
+        "applicability": 500,
+        "rationale": 800,
+        "limitations": 500,
         "confidence_basis": 300,
     }
     for field, maximum in limits.items():
@@ -572,11 +696,7 @@ def _validate_analysis(result: dict[str, Any], verification_id: str) -> dict[str
     if refs != [f"verification:{verification_id}"]:
         raise ProviderError("EvidenceReferenceMismatch")
     combined = " ".join(str(result[field]) for field in limits)
-    if (
-        re.search(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", combined)
-        or re.search(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", combined)
-        or re.search(r"(?i)(?:[A-Z]:\\|/)(?:[^\s,;]+[\\/])*[^\s,;]+", combined)
-    ):
+    if contains_sensitive_text(combined):
         raise ProviderError("SensitiveAnalysisRejected")
     if not result["should_store"]:
         return result
@@ -598,8 +718,9 @@ def _similar_existing(title: str, content: str, namespace: str) -> bool:
     return False
 
 
-def process_pending(*, limit: int = 10,
-                    provider: AnalysisProvider | None = None) -> dict[str, Any]:
+def process_pending(
+    *, limit: int = 10, provider: LearningAnalysisProvider | None = None
+) -> dict[str, Any]:
     """Обрабатывает ограниченное число подтверждённых событий вне Codex hook."""
     if not 1 <= limit <= 50:
         raise storage.StorageError("limit должен быть от 1 до 50")
@@ -613,9 +734,14 @@ def process_pending(*, limit: int = 10,
         if event is None:
             break
         verification = storage.get_verification(event["verification_id"])
-        if not verification or verification["exit_code"] != 0 or verification["trust_status"] != "trusted_local_process":
+        if (
+            not verification
+            or verification["exit_code"] != 0
+            or verification["trust_status"] != "trusted_local_process"
+        ):
             state = storage.fail_learning_event(
-                event["event_id"], error_type="MissingTrustedVerification",
+                event["event_id"],
+                error_type="MissingTrustedVerification",
                 max_attempts=MAX_ANALYSIS_ATTEMPTS,
             )
             outcomes.append({"event_id": event["event_id"], "status": state})
@@ -623,6 +749,7 @@ def process_pending(*, limit: int = 10,
         payload = {
             "task_summary": event["task_description"][:MAX_EVENT_TEXT],
             "project_namespace": project_namespace_from_id(event["project_id"]),
+            "changed_files": json.loads(event["changed_files"] or "[]"),
             "verification": {
                 "id": verification["verification_id"],
                 "type": verification["verification_type"],
@@ -651,37 +778,57 @@ def process_pending(*, limit: int = 10,
             )
             if _similar_existing(result["title"], content, namespace):
                 storage.finish_learning_event(
-                    event["event_id"], status="no_insight",
+                    event["event_id"],
+                    status="no_insight",
                     analysis=json.dumps({"decision": "similar_candidate_exists"}),
                 )
                 outcomes.append({"event_id": event["event_id"], "status": "duplicate"})
                 continue
             confidence = {"low": 0.35, "medium": 0.6, "high": 0.8}[result["confidence"]]
             candidate = storage.create_learning_candidate(
-                event["event_id"], category=result["category"],
-                title=result["title"], content=content,
-                rationale=result["rationale"], confidence=confidence,
-                namespace=namespace, analysis_json=analysis_json,
+                event["event_id"],
+                category=result["category"],
+                title=result["title"],
+                content=content,
+                rationale=result["rationale"],
+                confidence=confidence,
+                namespace=namespace,
+                analysis_json=analysis_json,
             )
             if candidate is None:
                 storage.finish_learning_event(
-                    event["event_id"], status="no_insight",
+                    event["event_id"],
+                    status="no_insight",
                     analysis=json.dumps({"decision": "exact_duplicate_exists"}),
                 )
                 outcomes.append({"event_id": event["event_id"], "status": "duplicate"})
             else:
-                outcomes.append({
-                    "event_id": event["event_id"], "status": "candidate_created",
-                    "knowledge_id": candidate["id"], "namespace": namespace,
-                })
+                outcomes.append(
+                    {
+                        "event_id": event["event_id"],
+                        "status": "candidate_created",
+                        "knowledge_id": candidate["id"],
+                        "namespace": namespace,
+                    }
+                )
         except Exception as exc:  # noqa: BLE001 - store only a class name.
             state = storage.fail_learning_event(
-                event["event_id"], error_type=type(exc).__name__,
+                event["event_id"],
+                error_type=type(exc).__name__,
                 max_attempts=MAX_ANALYSIS_ATTEMPTS,
             )
-            outcomes.append({"event_id": event["event_id"], "status": state,
-                             "error_type": type(exc).__name__})
-    return {"processed": len(outcomes), "provider": type(provider).__name__, "outcomes": outcomes}
+            outcomes.append(
+                {
+                    "event_id": event["event_id"],
+                    "status": state,
+                    "error_type": type(exc).__name__,
+                }
+            )
+    return {
+        "processed": len(outcomes),
+        "provider": type(provider).__name__,
+        "outcomes": outcomes,
+    }
 
 
 def project_namespace_from_id(project_id: str) -> str:

@@ -6,8 +6,9 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Any, Never
 
 from ai_engineering_memory import storage
 from ai_engineering_memory.application import MemoryService
@@ -37,10 +38,57 @@ def _configure_redirected_output() -> None:
             reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
-def _confirm_admin_action(expected: str, *, ask=None) -> bool:
+def _hide_diagnostic_paths(value: Any) -> Any:
+    """Удаляет локальные пути из отчёта по умолчанию перед его выводом."""
+    if isinstance(value, dict):
+        return {
+            key: _hide_diagnostic_paths(item)
+            for key, item in value.items()
+            if key != "path"
+        }
+    if isinstance(value, list):
+        return [_hide_diagnostic_paths(item) for item in value]
+    return value
+
+
+class _CLIArgumentParser(argparse.ArgumentParser):
+    """Сохраняет JSON-схему ошибок разбора аргументов CLI."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Создаёт parser с местом для аргументов текущего запуска."""
+        super().__init__(*args, **kwargs)
+        self._raw_args: list[str] = []
+
+    def error(self, message: str) -> Never:
+        """Выводит ошибку разбора в выбранном формате и сохраняет exit code 2."""
+        raw_args = getattr(self, "_raw_args", [])
+        json_mode = "--format=json" in raw_args or any(
+            raw_args[index : index + 2] == ["--format", "json"]
+            for index in range(len(raw_args))
+        )
+        if json_mode:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": {"type": "ArgumentError", "message": message},
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+            self.exit(2)
+        super().error(message)
+
+
+def _confirm_admin_action(
+    expected: str, *, ask: Callable[[str], str] | None = None
+) -> bool:
     """Требует интерактивный exact-match перед human-admin изменением."""
     if not sys.stdin.isatty():
-        raise ValueError("Привилегированное действие доступно только в интерактивном терминале")
+        raise ValueError(
+            "Привилегированное действие доступно только в интерактивном терминале"
+        )
     ask = ask or input
     received = ask(f"Для подтверждения введите {expected}: ").strip()
     if received != expected:
@@ -70,7 +118,9 @@ def _run_admin(args: argparse.Namespace) -> int:
             if not _confirm_admin_action(f"ROLLBACK {target}"):
                 return 1
             result = service.rollback_skill_version(
-                args.skill_name, args.version, maintainer=maintainer,
+                args.skill_name,
+                args.version,
+                maintainer=maintainer,
             )
         else:
             action = args.admin_action
@@ -86,20 +136,59 @@ def _run_admin(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser() -> _CLIArgumentParser:
     """Создаёт дерево команд CLI."""
-    parser = argparse.ArgumentParser(prog="ai-memory", description="Локальная инженерная память")
+    parser = _CLIArgumentParser(
+        prog="ai-memory", description="Локальная инженерная память"
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="формат результата (для JSON укажите до команды)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("setup", help="подготовить локальную базу памяти")
     commands.add_parser("init", help="создать или обновить локальную базу")
     commands.add_parser("status", help="показать состояние базы")
-    doctor = commands.add_parser("doctor", help="проверить базу, Codex hooks и их журнал")
-    doctor.add_argument("--json", action="store_true", help="вывести машинно-читаемый отчёт")
+    profile = commands.add_parser(
+        "profile", help="показать доступные профили изолированных баз"
+    )
+    profile_commands = profile.add_subparsers(dest="profile_action", required=True)
+    profile_commands.add_parser("show", help="показать выбранный профиль и путь базы")
+    profile_commands.add_parser("list", help="перечислить уже существующие профили")
+    search_index = commands.add_parser(
+        "search-index", help="проверить или вручную перестроить FTS5 индекс"
+    )
+    search_index_actions = search_index.add_subparsers(
+        dest="search_index_action", required=True
+    )
+    search_index_actions.add_parser(
+        "check", help="прочитать состояние поискового индекса"
+    )
+    search_index_actions.add_parser(
+        "rebuild", help="перестроить индекс после явного подтверждения"
+    )
+    doctor = commands.add_parser(
+        "doctor", help="проверить базу, Codex hooks и их журнал"
+    )
     doctor.add_argument(
-        "--probe-mcp", action="store_true",
+        "--json", action="store_true", help="вывести машинно-читаемый отчёт"
+    )
+    doctor.add_argument(
+        "--show-paths",
+        action="store_true",
+        help="показать абсолютные локальные пути в диагностическом отчёте",
+    )
+    doctor.add_argument(
+        "--probe-mcp",
+        action="store_true",
         help="запустить MCP и вызвать безопасный memory_search на временной БД",
     )
     doctor.add_argument(
-        "--cwd", type=Path, default=Path.cwd(),
+        "--cwd",
+        type=Path,
+        default=Path.cwd(),
         help="проектный каталог для read-only проверки .codex/config.toml",
     )
     project_config = commands.add_parser(
@@ -107,20 +196,35 @@ def _parser() -> argparse.ArgumentParser:
         help="напечатать MCP-конфигурацию для доверенного проекта Codex",
     )
     project_config.add_argument("--cwd", type=Path, default=Path.cwd())
-    hooks = commands.add_parser("hooks", help="установить Codex hooks без перезаписи остальных настроек")
+    hooks = commands.add_parser(
+        "hooks", help="установить Codex hooks без перезаписи остальных настроек"
+    )
     hook_actions = hooks.add_subparsers(dest="action", required=True)
-    install_hooks = hook_actions.add_parser("install", help="объединить hooks с профилем Codex")
+    install_hooks = hook_actions.add_parser(
+        "install", help="объединить hooks с профилем Codex"
+    )
     install_hooks.add_argument("--config", type=Path, help="путь к hooks.json")
-    install_hooks.add_argument("--dry-run", action="store_true", help="показать, потребуется ли изменение")
+    install_hooks.add_argument(
+        "--dry-run", action="store_true", help="показать, потребуется ли изменение"
+    )
     backup = commands.add_parser("backup", help="создать резервную копию базы")
-    backup.add_argument("destination", type=Path)
-    restore = commands.add_parser("restore", help="восстановить базу из резервной копии")
+    backup.add_argument("target", nargs="?", help="путь копии или действие verify")
+    backup.add_argument("extra", nargs="*", help="путь копии для backup verify")
+    restore = commands.add_parser(
+        "restore", help="восстановить базу из резервной копии"
+    )
     restore.add_argument("source", type=Path)
+    restore.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="проверить копию и миграцию без замены активной базы",
+    )
     admin = commands.add_parser("admin", help="human-only lifecycle actions")
     admin_commands = admin.add_subparsers(dest="admin_domain", required=True)
     admin_knowledge = admin_commands.add_parser("knowledge")
     admin_knowledge_actions = admin_knowledge.add_subparsers(
-        dest="admin_action", required=True,
+        dest="admin_action",
+        required=True,
     )
     for action in ("approve", "reject", "deprecate"):
         admin_action = admin_knowledge_actions.add_parser(action)
@@ -129,7 +233,8 @@ def _parser() -> argparse.ArgumentParser:
             admin_action.add_argument("--reason", required=True)
     admin_skills = admin_commands.add_parser("skill")
     admin_skill_actions = admin_skills.add_subparsers(
-        dest="admin_action", required=True,
+        dest="admin_action",
+        required=True,
     )
     for action in ("approve", "reject"):
         admin_action = admin_skill_actions.add_parser(action)
@@ -147,7 +252,9 @@ def _parser() -> argparse.ArgumentParser:
     listing.add_argument("--limit", type=int, default=100)
     search = sub.add_parser("search")
     search.add_argument("query")
-    search.add_argument("--status", default="approved", choices=[*sorted(storage.STATUSES), "all"])
+    search.add_argument(
+        "--status", default="approved", choices=[*sorted(storage.STATUSES), "all"]
+    )
     search.add_argument("--namespace")
     search.add_argument("--limit", type=int, default=10)
     review = sub.add_parser("review", help="проверить и решить судьбу candidates")
@@ -159,6 +266,12 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--content", required=True)
     add.add_argument("--technology", default="")
     add.add_argument("--namespace", default="global")
+    export = sub.add_parser("export", help="экспортировать выбранные approved знания")
+    export.add_argument("ids", nargs="+", type=int)
+    export.add_argument("--output", type=Path, required=True)
+    importer = sub.add_parser("import", help="импортировать знания как candidates")
+    importer.add_argument("source", type=Path)
+    importer.add_argument("--namespace", default="global")
     for action in ("approve", "reject", "deprecate"):
         item = sub.add_parser(action)
         item.add_argument("id", type=int)
@@ -173,17 +286,20 @@ def _parser() -> argparse.ArgumentParser:
     learning_commands = learning.add_subparsers(dest="action", required=True)
     learning_status = learning_commands.add_parser("status")
     learning_status.add_argument(
-        "--human", action="store_true",
+        "--human",
+        action="store_true",
         help="показать короткую сводку вместо JSON",
     )
     queue = learning_commands.add_parser("list")
     queue.add_argument("--limit", type=int, default=100)
     attempts = learning_commands.add_parser(
-        "attempts", help="показать метаданные последних запусков verifier",
+        "attempts",
+        help="показать метаданные последних запусков verifier",
     )
     attempts.add_argument("--limit", type=int, default=20)
-    attempts.add_argument("--all", action="store_true",
-                          help="включить успешные запуски")
+    attempts.add_argument(
+        "--all", action="store_true", help="включить успешные запуски"
+    )
     process = learning_commands.add_parser("process")
     process.add_argument("--limit", type=int, default=10)
     retry = learning_commands.add_parser("retry")
@@ -228,7 +344,9 @@ def _print_untrusted_block(label: str, value: str) -> None:
         print(f"  | {line}")
 
 
-def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
+def _review_candidates(
+    cwd: Path, *, limit: int, ask: Callable[[str], str] | None = None
+) -> int:
     """Показывает кандидатов текущего проекта и global с подтверждением решений."""
     from ai_engineering_memory import learning
 
@@ -238,7 +356,8 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
     project_namespace = learning.project_namespace(cwd)
     candidates = memory_service.list_candidates(namespace="global", limit=limit)
     project_candidates = memory_service.list_candidates(
-        namespace=project_namespace, limit=limit,
+        namespace=project_namespace,
+        limit=limit,
     )
     candidates.extend(project_candidates)
     candidates.sort(key=lambda item: (item["namespace"] != "global", -item["id"]))
@@ -283,21 +402,29 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
                 "без проверенной идентичности: "
                 f"{support['legacy_unfingerprinted_support_count'] + support['legacy_identity_support_count']}"
             )
-        choice = ask("Решение [a] утвердить, [r] отклонить, [s] пропустить, [q] выход: ")
+        choice = ask(
+            "Решение [a] утвердить, [r] отклонить, [s] пропустить, [q] выход: "
+        )
         choice = choice.strip().casefold()
         if choice in {"q", "quit", "выход"}:
             break
         if choice in {"s", "skip", "пропустить"}:
             continue
         if choice in {"a", "approve", "утвердить"}:
-            if ask(f"Для утверждения введи APPROVE {knowledge_id}: ").strip() != f"APPROVE {knowledge_id}":
+            if (
+                ask(f"Для утверждения введи APPROVE {knowledge_id}: ").strip()
+                != f"APPROVE {knowledge_id}"
+            ):
                 print("Подтверждение не совпало; кандидат не изменён.")
                 continue
             saved = admin_service.approve_knowledge(knowledge_id)
             print(f"Запись {knowledge_id}: {saved['status']}.")
             continue
         if choice in {"r", "reject", "отклонить"}:
-            if ask(f"Для отклонения введи REJECT {knowledge_id}: ").strip() != f"REJECT {knowledge_id}":
+            if (
+                ask(f"Для отклонения введи REJECT {knowledge_id}: ").strip()
+                != f"REJECT {knowledge_id}"
+            ):
                 print("Подтверждение не совпало; кандидат не изменён.")
                 continue
             reason = ask("Причина отклонения (до 500 символов): ").strip()
@@ -313,11 +440,105 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
 
 def _main(argv: Sequence[str] | None = None) -> int:
     """Выполняет команду и печатает результат в JSON или текстовом виде."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    parser._raw_args = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(argv)
+    result: Any = None
     try:
-        if args.command == "init":
+        if args.format == "json" and (
+            (args.command == "restore" and not args.dry_run)
+            or (
+                args.command == "search-index" and args.search_index_action == "rebuild"
+            )
+            or args.command in {"admin", "mcp"}
+            or (
+                args.command == "knowledge"
+                and args.action in {"review", "approve", "reject", "deprecate"}
+            )
+        ):
+            raise ValueError(
+                "JSON-режим недоступен для интерактивных и потоковых команд"
+            )
+        if args.command == "setup":
             storage.init_database()
-            print(f"База готова: {storage.current_database_path()}")
+            result = {
+                "status": "ready",
+                "next_steps": ["ai-memory hooks install", "ai-memory doctor"],
+            }
+            if args.format == "json":
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                print("Локальная память подготовлена.")
+                print("Затем установите Codex hooks: ai-memory hooks install")
+                print("Проверьте готовность: ai-memory doctor")
+        elif args.command == "init":
+            storage.init_database()
+            if args.format == "json":
+                print(json.dumps({"status": "ready"}, ensure_ascii=False))
+            else:
+                print(f"База готова: {storage.current_database_path()}")
+        elif args.command == "profile":
+            from ai_engineering_memory.settings import Settings
+
+            settings = Settings.from_environment(repository_data_dir=storage.DATA_DIR)
+            if args.profile_action == "show":
+                override = os.environ.get("AI_MEMORY_DB", "").strip()
+                selected_profile = settings.profile if not override else None
+                payload = {
+                    "profile": selected_profile,
+                    "selection": (
+                        "explicit_database"
+                        if override
+                        else "profile"
+                        if selected_profile
+                        else "shared_default"
+                    ),
+                    "database_path": str(settings.database_path),
+                    "database_exists": settings.database_path.is_file(),
+                }
+                if args.format == "json":
+                    print(json.dumps(payload, ensure_ascii=False))
+                else:
+                    print(f"Профиль: {payload['profile'] or '(общая база)'}")
+                    print(f"Выбор: {payload['selection']}")
+                    print(f"База: {payload['database_path']}")
+                    print(
+                        f"Файл существует: {'да' if payload['database_exists'] else 'нет'}"
+                    )
+            else:
+                profiles_root = (
+                    settings.data_root or settings.database_path.parent
+                ) / "profiles"
+                profiles: list[dict[str, str | bool]] = []
+                if profiles_root.is_dir():
+                    profiles = [
+                        {
+                            "name": child.name,
+                            "database_exists": (child / "memory.db").is_file(),
+                        }
+                        for child in sorted(
+                            profiles_root.iterdir(), key=lambda path: path.name
+                        )
+                        if child.is_dir() and (child / "memory.db").is_file()
+                    ]
+                if args.format == "json":
+                    print(json.dumps(profiles, ensure_ascii=False))
+                else:
+                    print(
+                        "\n".join(str(item["name"]) for item in profiles)
+                        or "Профилей пока нет."
+                    )
+        elif args.command == "search-index":
+            if args.search_index_action == "check":
+                result = storage.search_index_status()
+            else:
+                if not _confirm_admin_action("REBUILD SEARCH INDEX"):
+                    return 1
+                result = storage.rebuild_search_index()
+            if args.format == "json":
+                print(json.dumps(result, ensure_ascii=False))
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "project-config":
             from ai_engineering_memory import learning
 
@@ -325,21 +546,29 @@ def _main(argv: Sequence[str] | None = None) -> int:
             mcp_command = str(Path(sys.executable).resolve())
             project_path = str(project_root)
             mcp_args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
-            print("# Добавьте этот блок в <проект>/.codex/config.toml")
-            print("# Codex применяет проектную конфигурацию только для доверенных проектов.")
-            print("[mcp_servers.ai_engineering_memory]")
-            print(
-                "command = "
-                + json.dumps(mcp_command, ensure_ascii=False)
+            toml = "\n".join(
+                [
+                    "# Добавьте этот блок в <проект>/.codex/config.toml",
+                    "# Codex применяет проектную конфигурацию только для доверенных проектов.",
+                    "[mcp_servers.ai_engineering_memory]",
+                    "command = " + json.dumps(mcp_command, ensure_ascii=False),
+                    "args = " + json.dumps(mcp_args, ensure_ascii=False),
+                    "",
+                    "[mcp_servers.ai_engineering_memory.env]",
+                    "AI_MEMORY_PROJECT_ROOT = "
+                    + json.dumps(project_path, ensure_ascii=False),
+                ]
             )
-            print(
-                "args = " + json.dumps(mcp_args, ensure_ascii=False)
-            )
-            print("\n[mcp_servers.ai_engineering_memory.env]")
-            print(
-                "AI_MEMORY_PROJECT_ROOT = "
-                + json.dumps(project_path, ensure_ascii=False)
-            )
+            if args.format == "json":
+                print(
+                    json.dumps(
+                        {"project_root": project_path, "toml": toml},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(toml)
         elif args.command == "doctor":
             from ai_engineering_memory import codex_hooks, diagnostics
 
@@ -367,14 +596,27 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 expected_project_root=project_root,
                 probe_mcp=args.probe_mcp,
             )
-            if args.json:
-                print(json.dumps(report, ensure_ascii=False, indent=2))
+            if args.json or args.format == "json":
+                visible_report = (
+                    report if args.show_paths else _hide_diagnostic_paths(report)
+                )
+                print(json.dumps(visible_report, ensure_ascii=False, indent=2))
             else:
-                labels = {"ok": "OK", "warning": "ВНИМАНИЕ", "error": "ОШИБКА", "missing": "НЕТ"}
-                print(f"AI Engineering Memory — диагностика: {labels[report['overall']]}")
-                database = report["database"]
+                labels = {
+                    "ok": "OK",
+                    "warning": "ВНИМАНИЕ",
+                    "error": "ОШИБКА",
+                    "missing": "НЕТ",
+                }
                 print(
-                    f"База: {labels[database['status']]} · {database['path']} · "
+                    f"AI Engineering Memory — диагностика: {labels[report['overall']]}"
+                )
+                database = report["database"]
+                database_location = (
+                    f" · {database['path']}" if args.show_paths else " · путь скрыт"
+                )
+                print(
+                    f"База: {labels[database['status']]}{database_location} · "
                     f"quick_check={database['integrity']} · schema={database['schema_version']}"
                 )
                 if database.get("recommendation"):
@@ -382,13 +624,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 knowledge_counts = database.get("knowledge_counts")
                 if knowledge_counts is not None:
                     status_counts = knowledge_counts.get("status_counts", {})
-                    status_summary = ", ".join(
-                        f"{_safe_terminal_text(status)}={count}"
-                        for status, count in sorted(status_counts.items())
-                    ) or "статусов пока нет"
+                    status_summary = (
+                        ", ".join(
+                            f"{_safe_terminal_text(status)}={count}"
+                            for status, count in sorted(status_counts.items())
+                        )
+                        or "статусов пока нет"
+                    )
                     print(
-                        f"Знания: всего {knowledge_counts['total']} · "
-                        f"{status_summary}"
+                        f"Знания: всего {knowledge_counts['total']} · {status_summary}"
                     )
                 elif database.get("integrity") == "skipped_active_wal":
                     print(
@@ -408,10 +652,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     if task_status_summary:
                         task_label += f" ({task_status_summary})"
                     verifications = learning_counts.get(
-                        "verification_records", {},
+                        "verification_records",
+                        {},
                     ).get("total", 0)
                     corroborations = learning_counts.get(
-                        "learning_corroborations", {},
+                        "learning_corroborations",
+                        {},
                     ).get("total", 0)
                     print(
                         f"Обучение: {task_label} · проверок {verifications} · "
@@ -432,7 +678,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     timestamp = _safe_terminal_text(
                         details.get("timestamp") or "время неизвестно",
                     )
-                    result = _safe_terminal_text(
+                    hook_result = _safe_terminal_text(
                         details.get("result") or "результат неизвестен",
                     )
                     source = _safe_terminal_text(
@@ -450,17 +696,22 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     instruction_label = ""
                     if event == "UserPromptSubmit":
                         instruction_state = (
-                            "enabled" if instruction is True
-                            else "not_added" if instruction is False
+                            "enabled"
+                            if instruction is True
+                            else "not_added"
+                            if instruction is False
                             else "unknown"
                         )
-                        instruction_label = f" | learning_instruction={instruction_state}"
+                        instruction_label = (
+                            f" | learning_instruction={instruction_state}"
+                        )
                     print(
-                        f"  Последний запуск {event}: {timestamp} · {result} · "
+                        f"  Последний запуск {event}: {timestamp} · {hook_result} · "
                         f"{source}{duration_label}{instruction_label}{error_label}"
                     )
                 unavailable = [
-                    event for event, available in hooks.get("launchers", {}).items()
+                    event
+                    for event, available in hooks.get("launchers", {}).items()
                     if not available
                 ]
                 if unavailable:
@@ -468,7 +719,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 metadata_mismatch = hooks.get("metadata_mismatch_events", [])
                 handler_metadata = hooks.get("handler_metadata", {})
                 timeout_mismatch = [
-                    event for event in metadata_mismatch
+                    event
+                    for event in metadata_mismatch
                     if not handler_metadata.get(event, {}).get(
                         "timeout_matches_expected", False
                     )
@@ -482,7 +734,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         + ", ".join(timeout_mismatch)
                     )
                 if status_message_mismatch:
-                    print("  Несовпадение statusMessage меняет только текст уведомления; оно не мешает запуску обработчика.")
+                    print(
+                        "  Несовпадение statusMessage меняет только текст уведомления; оно не мешает запуску обработчика."
+                    )
                 if metadata_mismatch:
                     print(
                         "  Проверьте `.venv\\Scripts\\ai-memory.exe hooks install --dry-run`, "
@@ -504,14 +758,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "invalid": "ошибка формата конфигурации",
                     "error": "ошибка чтения конфигурации",
                 }.get(memory_mcp["status"], "неизвестно")
-                if args.probe_mcp and memory_mcp.get("protocol_probe_status") == "verified":
-                    memory_mcp_state = (
-                        "проверка запуска из doctor прошла; runtime Codex не подтверждён"
-                    )
-                print(
-                    "MCP AI Engineering Memory: "
-                    f"{memory_mcp_state}"
-                )
+                if (
+                    args.probe_mcp
+                    and memory_mcp.get("protocol_probe_status") == "verified"
+                ):
+                    memory_mcp_state = "проверка запуска из doctor прошла; runtime Codex не подтверждён"
+                print(f"MCP AI Engineering Memory: {memory_mcp_state}")
                 config_scope = memory_mcp.get("config_scope", "user")
                 if config_scope == "project":
                     print(
@@ -520,7 +772,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     )
                 elif config_scope == "user":
                     print("  Источник: пользовательская конфигурация Codex.")
-                if args.probe_mcp and memory_mcp.get("protocol_probe_status") == "verified":
+                if (
+                    args.probe_mcp
+                    and memory_mcp.get("protocol_probe_status") == "verified"
+                ):
                     print(
                         f"  MCP initialize/tools/list: OK · инструментов: "
                         f"{memory_mcp['protocol_probe_tool_count']}; "
@@ -544,10 +799,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         "skipped_project_scope_unverified": "рабочую область MCP нельзя надёжно сверить; процесс не запускался",
                     }
                     probe_status = memory_mcp.get("protocol_probe_status", "unknown")
-                    probe_message = probe_messages.get(probe_status, "причина не определена")
+                    probe_message = probe_messages.get(
+                        probe_status, "причина не определена"
+                    )
                     print(f"  MCP protocol probe: {probe_status} · {probe_message}")
                     if memory_mcp.get("protocol_probe_error_type"):
-                        print(f"  Тип ошибки: {memory_mcp['protocol_probe_error_type']}")
+                        print(
+                            f"  Тип ошибки: {memory_mcp['protocol_probe_error_type']}"
+                        )
                 project_scope = {
                     "configured_root": "закреплённый AI_MEMORY_PROJECT_ROOT",
                     "configured_cwd": "рабочий каталог MCP из конфигурации",
@@ -588,10 +847,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         + ", ".join(latest_error_events)
                     )
                 if hook_log["missing_events"]:
-                    print(
-                        "  Нет записей для: "
-                        + ", ".join(hook_log["missing_events"])
-                    )
+                    print("  Нет записей для: " + ", ".join(hook_log["missing_events"]))
                 if hook_log.get("stale_source_events"):
                     print(
                         "  Версия последней записи отличается от ожидаемой для: "
@@ -603,8 +859,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     )
                     if hook_log.get("expected_source"):
                         print(
-                            "  Ожидаемый источник кода: "
-                            + hook_log["expected_source"]
+                            "  Ожидаемый источник кода: " + hook_log["expected_source"]
                         )
                 for event, record in hook_log["events"].items():
                     print(
@@ -629,20 +884,68 @@ def _main(argv: Sequence[str] | None = None) -> int:
             from ai_engineering_memory import hook_install
 
             result = hook_install.install_hooks(
-                args.config, dry_run=args.dry_run,
+                args.config,
+                dry_run=args.dry_run,
             )
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "status":
             entries = _memory_service().list_knowledge(limit=500)
-            print(json.dumps({"database": str(storage.current_database_path()), "knowledge": len(entries),
-                              "skills": len(create_skills_service().list_skills())}, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "database": str(storage.current_database_path()),
+                        "knowledge": len(entries),
+                        "skills": len(create_skills_service().list_skills()),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         elif args.command == "backup":
-            print(storage.backup_database(args.destination))
+            if args.target == "verify":
+                if len(args.extra) != 1:
+                    raise ValueError("Использование: ai-memory backup verify <путь>")
+                result = storage.verify_database_backup(Path(args.extra[0]))
+            else:
+                if args.target is None or args.extra:
+                    raise ValueError(
+                        "Использование: ai-memory backup <путь> или backup verify <путь>"
+                    )
+                result = storage.backup_database(Path(args.target))
+            if args.format == "json":
+                payload = (
+                    result if isinstance(result, dict) else {"backup_path": str(result)}
+                )
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            elif isinstance(result, dict):
+                print(
+                    "Копия проверена: "
+                    f"schema={result['schema_version']} · "
+                    f"записей={result['knowledge_count']} · "
+                    f"schema_current={result['schema_current']}"
+                )
+            else:
+                print(result)
         elif args.command == "restore":
             source = args.source.expanduser().resolve()
+            if args.dry_run:
+                result = storage.dry_run_restore_database(source)
+                if args.format == "json":
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(
+                        "Проверка восстановления пройдена: "
+                        f"записей={result['knowledge_count']} · "
+                        f"integer ID сохранены · "
+                        f"schema={result['source_schema_version']}→"
+                        f"{result['restored_schema_version']}"
+                    )
+                return 0
             destination = storage.current_database_path().resolve()
             expected = f"RESTORE {source} -> {destination}"
-            print("Перед восстановлением остановите Codex/MCP и другие процессы, использующие эту базу.")
+            print(
+                "Перед восстановлением остановите Codex/MCP и другие процессы, использующие эту базу."
+            )
             if not _confirm_admin_action(expected):
                 return 1
             result = storage.restore_database(source)
@@ -652,7 +955,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "knowledge":
             if args.action == "list":
                 result = _memory_service().list_knowledge(
-                    status=args.status, namespace=args.namespace, limit=args.limit,
+                    status=args.status,
+                    namespace=args.namespace,
+                    limit=args.limit,
                 )
             elif args.action == "search":
                 result = _memory_service().search(
@@ -673,6 +978,30 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     technology=args.technology,
                     namespace=args.namespace,
                 )
+            elif args.action == "export":
+                if args.output.exists():
+                    raise ValueError(
+                        "Файл экспорта уже существует; выберите новый путь"
+                    )
+                export_payload = storage.export_knowledge(args.ids)
+                try:
+                    with args.output.open("x", encoding="utf-8") as stream:
+                        stream.write(
+                            json.dumps(export_payload, ensure_ascii=False, indent=2)
+                            + "\n"
+                        )
+                except FileExistsError as exc:
+                    raise ValueError(
+                        "Файл экспорта уже существует; выберите новый путь"
+                    ) from exc
+                result = {
+                    "status": "exported",
+                    "record_count": len(export_payload["knowledge"]),
+                }
+            elif args.action == "import":
+                payload = json.loads(args.source.read_text(encoding="utf-8"))
+                ids = storage.import_knowledge(payload, namespace=args.namespace)
+                result = {"status": "imported_as_candidates", "ids": ids}
             elif args.action in {"approve", "reject", "deprecate"}:
                 if not _confirm_admin_action(f"{args.action.upper()} {args.id}"):
                     return 1
@@ -680,7 +1009,10 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 if args.action == "approve":
                     result = admin_service.approve_knowledge(args.id)
                 elif args.action == "reject":
-                    reason = args.reason or input("Причина отклонения (обязательна): ").strip()
+                    reason = (
+                        args.reason
+                        or input("Причина отклонения (обязательна): ").strip()
+                    )
                     result = admin_service.reject_knowledge(args.id, reason=reason)
                 else:
                     result = admin_service.deprecate_knowledge(args.id)
@@ -709,8 +1041,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 try:
                     provider = learning.configured_provider()
                     summary["provider_configured"] = provider is not None
-                    summary["provider_type"] = type(provider).__name__ if provider else None
-                    summary["llm_provider"] = "ollama-local" if provider else "not configured"
+                    summary["provider_type"] = (
+                        type(provider).__name__ if provider else None
+                    )
+                    summary["llm_provider"] = (
+                        "ollama-local" if provider else "not configured"
+                    )
                     summary["automatic_analysis"] = False
                     summary["background_analysis_configured"] = False
                     summary["legacy_manual_analysis_available"] = provider is not None
@@ -720,12 +1056,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     summary["llm_provider"] = "not configured"
                     summary["automatic_analysis"] = False
                     summary["legacy_manual_analysis_available"] = False
-                if args.human:
+                if args.human and args.format != "json":
                     statuses = summary.get("status_counts", {})
-                    status_summary = ", ".join(
-                        f"{_safe_terminal_text(status)}={count}"
-                        for status, count in sorted(statuses.items())
-                    ) or "нет"
+                    status_summary = (
+                        ", ".join(
+                            f"{_safe_terminal_text(status)}={count}"
+                            for status, count in sorted(statuses.items())
+                        )
+                        or "нет"
+                    )
                     attempts = summary.get("verification_attempts", {})
                     print(
                         f"Обучение: событий {summary.get('total', 0)} "
@@ -751,25 +1090,50 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 else:
                     print(json.dumps(summary, ensure_ascii=False, indent=2))
             elif args.action == "list":
-                print(json.dumps(learning_service.list_events(limit=args.limit),
-                                 ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        learning_service.list_events(limit=args.limit),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             elif args.action == "attempts":
-                print(json.dumps(learning_service.list_attempts(
-                    limit=args.limit, failed_only=not args.all,
-                ), ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        learning_service.list_attempts(
+                            limit=args.limit,
+                            failed_only=not args.all,
+                        ),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             elif args.action == "process":
-                print(json.dumps(learning_service.process_pending(limit=args.limit),
-                                 ensure_ascii=False, indent=2))
+                print(
+                    json.dumps(
+                        learning_service.process_pending(limit=args.limit),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             elif args.action == "retry":
                 learning_service.retry_event(args.event_id)
-                print(json.dumps({"event_id": args.event_id, "status": "pending_analysis"}))
+                print(
+                    json.dumps(
+                        {"event_id": args.event_id, "status": "pending_analysis"}
+                    )
+                )
             elif args.action == "verify":
                 command = list(args.program_argv)
                 if command and command[0] == "--":
                     command.pop(0)
                 result = learning_service.verify_command(
-                    args.task_id, args.summary, command, cwd=args.cwd,
-                    timeout=args.timeout, changed_files=args.changed_file,
+                    args.task_id,
+                    args.summary,
+                    command,
+                    cwd=args.cwd,
+                    timeout=args.timeout,
+                    changed_files=args.changed_file,
                 )
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 if not result["process_succeeded"]:
@@ -778,14 +1142,31 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 result = learning_service.withdraw_candidate(
                     args.knowledge_id, reason=args.reason
                 )
-                print(json.dumps({"id": result["id"], "status": result["status"]},
-                                 ensure_ascii=False))
+                print(
+                    json.dumps(
+                        {"id": result["id"], "status": result["status"]},
+                        ensure_ascii=False,
+                    )
+                )
         elif args.command == "mcp":
             from ai_engineering_memory.mcp_server import serve
+
             serve()
         return 0
     except (storage.StorageError, OSError, TypeError, ValueError, RuntimeError) as exc:
-        print(f"Ошибка: {exc}", file=sys.stderr)
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(f"Ошибка: {exc}", file=sys.stderr)
         return 2
 
 

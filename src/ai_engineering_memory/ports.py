@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 
@@ -20,7 +21,19 @@ class KnowledgeRepository(Protocol):
         read_only: bool,
     ) -> list[dict[str, Any]]: ...
 
-    def get(self, knowledge_id: int) -> dict[str, Any] | None: ...
+    def get(
+        self,
+        knowledge_id: int,
+        *,
+        read_only: bool = False,
+    ) -> dict[str, Any] | None: ...
+
+    def get_by_ids(
+        self,
+        knowledge_ids: Sequence[int],
+        *,
+        read_only: bool = False,
+    ) -> list[dict[str, Any]]: ...
 
     def get_evidence(self, knowledge_id: int) -> list[dict[str, Any]]: ...
 
@@ -45,7 +58,10 @@ class KnowledgeRepository(Protocol):
     ) -> dict[str, Any]: ...
 
     def list_candidates(
-        self, *, namespace: str, limit: int,
+        self,
+        *,
+        namespace: str,
+        limit: int,
     ) -> list[dict[str, Any]]: ...
 
     def overview(self, *, namespace: str) -> dict[str, Any]: ...
@@ -55,7 +71,8 @@ class LearningRepository(Protocol):
     """Контракт доступа к очереди событий и записям локальной проверки."""
 
     def get_event_by_verification(
-        self, verification_id: str,
+        self,
+        verification_id: str,
     ) -> dict[str, Any] | None: ...
 
     def ingest_task_event(self, event: dict[str, Any]) -> dict[str, Any]: ...
@@ -67,13 +84,19 @@ class LearningRepository(Protocol):
     def list_events(self, *, limit: int) -> list[dict[str, Any]]: ...
 
     def list_attempts(
-        self, *, limit: int, failed_only: bool,
+        self,
+        *,
+        limit: int,
+        failed_only: bool,
     ) -> list[dict[str, Any]]: ...
 
     def retry_event(self, event_id: str) -> None: ...
 
     def withdraw_candidate(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]: ...
 
 
@@ -82,11 +105,35 @@ class LearningWorkflow(Protocol):
 
     def verify_command(self, *args: Any, **kwargs: Any) -> dict[str, Any]: ...
 
-    def submit_codex_candidate(self, **kwargs: Any) -> dict[str, Any]: ...
+    def submit_codex_candidate(
+        self,
+        *,
+        verification_id: str,
+        title: str,
+        category: str,
+        summary: str,
+        problem: str,
+        root_cause: str,
+        solution: str,
+        conditions: str,
+        limitations: str,
+        verification_summary: str,
+        evidence_refs: list[str],
+        confidence: str,
+        confidence_basis: str,
+    ) -> dict[str, Any]: ...
 
-    def process_pending(self, *, limit: int) -> dict[str, Any]: ...
+    def process_pending(
+        self, *, limit: int, provider: LearningAnalysisProvider | None = None
+    ) -> dict[str, Any]: ...
 
     def project_namespace_from_id(self, project_id: str) -> str: ...
+
+
+class LearningAnalysisProvider(Protocol):
+    """Контракт структурированного анализа локально проверенного события."""
+
+    def analyze(self, payload: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class SkillsRepository(Protocol):
@@ -97,7 +144,11 @@ class SkillsRepository(Protocol):
     def get_skill(self, name: str) -> dict[str, Any]: ...
 
     def propose_update(
-        self, skill_name: str, proposer: str, description: str, content: str,
+        self,
+        skill_name: str,
+        proposer: str,
+        description: str,
+        content: str,
     ) -> str: ...
 
     def list_proposals(self, status: str) -> list[dict[str, Any]]: ...
@@ -113,16 +164,27 @@ class AdminRepository(Protocol):
     def approve_knowledge(self, knowledge_id: int) -> dict[str, Any]: ...
 
     def reject_knowledge(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]: ...
 
     def deprecate_knowledge(self, knowledge_id: int) -> dict[str, Any]: ...
 
     def decide_skill_proposal(
-        self, proposal_id: str, *, decision: str,
-        maintainer: str, reason: str,
+        self,
+        proposal_id: str,
+        *,
+        decision: str,
+        maintainer: str,
+        reason: str,
     ) -> dict[str, Any]: ...
 
     def rollback_skill_version(
-        self, skill_name: str, version: str, *, maintainer: str,
+        self,
+        skill_name: str,
+        version: str,
+        *,
+        maintainer: str,
     ) -> dict[str, Any]: ...

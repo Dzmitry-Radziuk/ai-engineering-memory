@@ -25,7 +25,10 @@ class Database:
 
     @contextmanager
     def connect(
-        self, *, read_only: bool = False, timeout: float = 10.0,
+        self,
+        *,
+        read_only: bool = False,
+        timeout: float = 10.0,
     ) -> Iterator[sqlite3.Connection]:
         """Открывает отдельное SQLite-соединение с включёнными внешними ключами."""
         if read_only:
@@ -44,7 +47,8 @@ class Database:
 
 
 _active_database: ContextVar[Database | None] = ContextVar(
-    "ai_engineering_memory_database", default=None,
+    "ai_engineering_memory_database",
+    default=None,
 )
 
 

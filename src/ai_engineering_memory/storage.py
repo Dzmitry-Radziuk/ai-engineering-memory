@@ -24,6 +24,9 @@ from ai_engineering_memory.database import (
     current_database,
     use_database,
 )
+from ai_engineering_memory.privacy import (
+    contains_sensitive_text as _contains_sensitive_text,
+)
 from ai_engineering_memory.settings import Settings
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -34,20 +37,6 @@ _fts_unavailable = migrations.fts_unavailable
 MAX_TEXT_LENGTH = 100_000
 STATUSES = {"candidate", "approved", "rejected", "deprecated"}
 MAX_LEARNING_ATTEMPTS = 3
-_SENSITIVE_SECRET_PATTERNS = (
-    r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+",
-    r"(?i)\bbearer\s+\S+",
-    r"(?i)-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
-    r"(?i)\b(?:postgres(?:ql)?|mysql|redis)://[^:\s/@]+:[^@\s]+@",
-    r"(?i)\bhttps?://[^/\s:@]+:[^@\s/]+@",
-    r"\bAKIA[0-9A-Z]{16}\b",
-    r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
-    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
-)
-_SENSITIVE_LOCATION_PATTERNS = (
-    r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
-    r"(?i)(?:[A-Z]:\\|/)(?:[^\s,;]+[\\/])*[^\s,;]+",
-)
 
 
 class StorageError(ValueError):
@@ -58,9 +47,13 @@ def require_maintainer(maintainer: str) -> str:
     """Проверяет локального владельца и отказывает, если владелец не настроен."""
     configured = os.environ.get("AI_MEMORY_MAINTAINER", "").strip()
     if not configured:
-        raise StorageError("AI_MEMORY_MAINTAINER не настроен; решение maintainer запрещено")
+        raise StorageError(
+            "AI_MEMORY_MAINTAINER не настроен; решение maintainer запрещено"
+        )
     if not maintainer or maintainer != configured:
-        raise StorageError("Действие разрешено только настроенному локальному maintainer")
+        raise StorageError(
+            "Действие разрешено только настроенному локальному maintainer"
+        )
     return configured
 
 
@@ -70,11 +63,20 @@ def current_database_path() -> Path:
 
 
 @contextmanager
-def _connect(*, read_only: bool = False, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
+def _connect(
+    *, read_only: bool = False, timeout: float = 10.0
+) -> Iterator[sqlite3.Connection]:
     """Открывает изолированное соединение с локальной базой."""
     database = current_database(DATABASE_PATH)
     with database.connect(read_only=read_only, timeout=timeout) as connection:
         yield connection
+
+
+def _last_insert_id(cursor: sqlite3.Cursor) -> int:
+    """Возвращает ID вставленной строки или сообщает о нарушении SQLite-контракта."""
+    if cursor.lastrowid is None:
+        raise StorageError("SQLite не вернул ID созданной записи")
+    return cursor.lastrowid
 
 
 class Storage:
@@ -95,7 +97,7 @@ class Storage:
         with use_database(self.database):
             yield
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         """Вызывает legacy storage API внутри изолированного database context."""
         function = globals().get(name)
         if name.startswith("_") or not inspect.isfunction(function):
@@ -133,22 +135,6 @@ def _validate_text(value: str, field: str, maximum: int = MAX_TEXT_LENGTH) -> st
     return value.strip()
 
 
-def _contains_sensitive_secret(value: str) -> bool:
-    """Находит распространённые шаблоны credentials и токенов без проверки путей."""
-    return any(re.search(pattern, value) for pattern in _SENSITIVE_SECRET_PATTERNS)
-
-
-def _contains_sensitive_text(value: str) -> bool:
-    """Находит распространённые шаблоны секретов, контактов и приватных путей."""
-    if _contains_sensitive_secret(value):
-        return True
-    without_web_urls = re.sub(r"(?i)https?://[^\s<>()]+", " ", value)
-    return any(
-        re.search(pattern, without_web_urls)
-        for pattern in _SENSITIVE_LOCATION_PATTERNS
-    )
-
-
 def _validate_decision_reason(reason: str) -> str:
     """Ограничивает причину решения и отсекает частые приватные данные."""
     cleaned = _validate_text(reason, "reason", 500)
@@ -178,33 +164,57 @@ def create_knowledge(
     namespace = _validate_text(namespace, "namespace", 200)
     if not 0 <= confidence <= 1:
         raise StorageError("confidence должен быть от 0 до 1")
-    digest = hashlib.sha256((category.lower() + "\0" + title.lower() + "\0" + content.lower()).encode()).hexdigest()
+    digest = hashlib.sha256(
+        (category.lower() + "\0" + title.lower() + "\0" + content.lower()).encode()
+    ).hexdigest()
     now = datetime.now(UTC).isoformat()
     with _connect() as connection:
         duplicate = connection.execute(
-            "SELECT id FROM knowledge WHERE content_hash = ? AND namespace = ?", (digest, namespace)
+            "SELECT id FROM knowledge WHERE content_hash = ? AND namespace = ?",
+            (digest, namespace),
         ).fetchone()
         if duplicate:
-            raise StorageError(f"В этом пространстве уже есть точный дубликат: id={duplicate['id']}")
+            raise StorageError(
+                f"В этом пространстве уже есть точный дубликат: id={duplicate['id']}"
+            )
         cursor = connection.execute(
             """INSERT INTO knowledge
             (uuid,category,title,content,status,source_type,source_reference,technology,
              confidence,namespace,updated_at,content_hash,publishable)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(uuid.uuid4()), category, title, content, "candidate", source_type,
-             source_reference, technology, confidence, namespace, now, digest, int(publishable)),
+            (
+                str(uuid.uuid4()),
+                category,
+                title,
+                content,
+                "candidate",
+                source_type,
+                source_reference,
+                technology,
+                confidence,
+                namespace,
+                now,
+                digest,
+                int(publishable),
+            ),
         )
-        knowledge_id = cursor.lastrowid
+        knowledge_id = _last_insert_id(cursor)
         if evidence:
             connection.execute(
                 "INSERT INTO evidence(knowledge_id,kind,result,source,checked_at,limitations,confidence) VALUES(?,?,?,?,?,?,?)",
-                (knowledge_id, _validate_text(evidence["kind"], "kind", 100),
-                 _validate_text(evidence["result"], "result", 1000),
-                 str(evidence.get("source", ""))[:2000], now,
-                 str(evidence.get("limitations", ""))[:2000],
-                 float(evidence.get("confidence", confidence))),
+                (
+                    knowledge_id,
+                    _validate_text(evidence["kind"], "kind", 100),
+                    _validate_text(evidence["result"], "result", 1000),
+                    str(evidence.get("source", ""))[:2000],
+                    now,
+                    str(evidence.get("limitations", ""))[:2000],
+                    float(evidence.get("confidence", confidence)),
+                ),
             )
-        row = connection.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+        ).fetchone()
         return dict(row)
 
 
@@ -213,14 +223,51 @@ def add_knowledge(category: str, title: str, content: str) -> int:
     return int(create_knowledge(category, title, content)["id"])
 
 
-def get_knowledge(knowledge_id: int | None = None) -> list[dict[str, Any]] | dict[str, Any] | None:
+def get_knowledge(
+    knowledge_id: int | None = None,
+    *,
+    _read_only: bool = False,
+) -> list[dict[str, Any]] | dict[str, Any] | None:
     """Возвращает одну запись по ID или все записи по убыванию ID."""
-    init_database()
-    with _connect() as connection:
+    if _read_only and not current_database_path().is_file():
+        return None if knowledge_id is not None else []
+    if not _read_only:
+        init_database()
+    with _connect(read_only=_read_only) as connection:
         if knowledge_id is not None:
-            row = connection.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone()
             return dict(row) if row else None
-        return [dict(row) for row in connection.execute("SELECT * FROM knowledge ORDER BY id DESC")]
+        return [
+            dict(row)
+            for row in connection.execute("SELECT * FROM knowledge ORDER BY id DESC")
+        ]
+
+
+def get_knowledge_by_ids(
+    knowledge_ids: list[int],
+    *,
+    _read_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Читает ограниченный набор строк одним соединением без изменения их порядка."""
+    ids = list(dict.fromkeys(knowledge_ids))
+    if not ids:
+        return []
+    if len(ids) > 900 or any(type(knowledge_id) is not int for knowledge_id in ids):
+        raise StorageError("Допустимо не более 900 целочисленных ID")
+    if _read_only and not current_database_path().is_file():
+        return []
+    if not _read_only:
+        init_database()
+    placeholders = ",".join("?" for _ in ids)
+    with _connect(read_only=_read_only) as connection:
+        rows = connection.execute(
+            f"SELECT * FROM knowledge WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    by_id = {row["id"]: dict(row) for row in rows}
+    return [by_id[knowledge_id] for knowledge_id in ids if knowledge_id in by_id]
 
 
 def get_knowledge_evidence(knowledge_id: int) -> list[dict[str, Any]]:
@@ -235,7 +282,9 @@ def get_knowledge_evidence(knowledge_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def list_knowledge(*, status: str | None = None, namespace: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def list_knowledge(
+    *, status: str | None = None, namespace: str | None = None, limit: int = 100
+) -> list[dict[str, Any]]:
     """Выводит знания с ограничением объёма и фильтрами области видимости."""
     init_database()
     if not 1 <= limit <= 500:
@@ -253,7 +302,13 @@ def list_knowledge(*, status: str | None = None, namespace: str | None = None, l
         params.append(namespace)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     with _connect() as connection:
-        return [dict(r) for r in connection.execute(f"SELECT * FROM knowledge{where} ORDER BY id DESC LIMIT ?", (*params, limit))]
+        return [
+            dict(r)
+            for r in connection.execute(
+                f"SELECT * FROM knowledge{where} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
+            )
+        ]
 
 
 def memory_overview(*, namespace: str | None = None) -> dict[str, Any]:
@@ -305,37 +360,138 @@ def memory_overview(*, namespace: str | None = None) -> dict[str, Any]:
     }
 
 
+def search_index_status() -> dict[str, Any]:
+    """Проверяет наличие FTS-индекса без создания или миграции базы."""
+    database_path = current_database_path()
+    if not database_path.is_file():
+        return {
+            "status": "database_missing",
+            "backend": "uninitialized",
+            "fts_available": False,
+            "triggers_available": False,
+        }
+    with _connect(read_only=True) as connection:
+        objects = {
+            row["name"]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','trigger')"
+            )
+        }
+        fts_available = "knowledge_fts" in objects
+        triggers_available = {
+            "knowledge_ai",
+            "knowledge_ad",
+            "knowledge_au",
+        }.issubset(objects)
+        schema_version = _database_schema_version(connection)
+    return {
+        "status": "ready" if fts_available and triggers_available else "fallback",
+        "backend": "fts5" if fts_available and triggers_available else "like",
+        "fts_available": fts_available,
+        "triggers_available": triggers_available,
+        "schema_version": schema_version,
+    }
+
+
+def rebuild_search_index() -> dict[str, Any]:
+    """Перестраивает только FTS-копию из канонической таблицы knowledge."""
+    if not current_database_path().is_file():
+        raise StorageError("База не найдена; сначала выполните ai-memory setup")
+    init_database()
+    with _connect() as connection:
+        if (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_fts'"
+            ).fetchone()
+            is None
+        ):
+            raise StorageError("FTS5 недоступен; поиск продолжит работать через LIKE")
+        try:
+            connection.execute(
+                "INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')"
+            )
+        except sqlite3.OperationalError as exc:
+            if not migrations.fts_unavailable(exc):
+                raise
+            raise StorageError(
+                "FTS5 недоступен; поиск продолжит работать через LIKE"
+            ) from exc
+    result = search_index_status()
+    result["status"] = "rebuilt" if result["backend"] == "fts5" else "fallback"
+    return result
+
+
 def update_knowledge(knowledge_id: int, **changes: Any) -> dict[str, Any]:
     """Обновляет разрешённые поля записи в транзакции."""
     init_database()
-    allowed = {"category", "title", "content", "technology", "confidence", "source_reference", "namespace", "publishable"}
+    allowed = {
+        "category",
+        "title",
+        "content",
+        "technology",
+        "confidence",
+        "source_reference",
+        "namespace",
+        "publishable",
+    }
     if not changes or set(changes) - allowed:
         raise StorageError("Переданы пустые или неподдерживаемые поля")
     if "confidence" in changes and not 0 <= changes["confidence"] <= 1:
         raise StorageError("confidence должен быть от 0 до 1")
     if "publishable" in changes:
         changes["publishable"] = int(bool(changes["publishable"]))
-    for key in {"category", "title", "content", "technology", "namespace"} & changes.keys():
+    for key in {
+        "category",
+        "title",
+        "content",
+        "technology",
+        "namespace",
+    } & changes.keys():
         changes[key] = _validate_text(changes[key], key)
     changes["updated_at"] = datetime.now(UTC).isoformat()
     with _connect() as connection:
         if "category" in changes or "title" in changes or "content" in changes:
-            row = connection.execute("SELECT category,title,content,namespace FROM knowledge WHERE id=?", (knowledge_id,)).fetchone()
+            row = connection.execute(
+                "SELECT category,title,content,namespace FROM knowledge WHERE id=?",
+                (knowledge_id,),
+            ).fetchone()
             if not row:
                 raise StorageError("Знание не найдено")
             values = {**dict(row), **changes}
-            changes["content_hash"] = hashlib.sha256((values["category"].lower()+"\0"+values["title"].lower()+"\0"+values["content"].lower()).encode()).hexdigest()
+            changes["content_hash"] = hashlib.sha256(
+                (
+                    values["category"].lower()
+                    + "\0"
+                    + values["title"].lower()
+                    + "\0"
+                    + values["content"].lower()
+                ).encode()
+            ).hexdigest()
         assignments = ",".join(f"{key}=?" for key in changes)
-        cursor = connection.execute(f"UPDATE knowledge SET {assignments} WHERE id=?", (*changes.values(), knowledge_id))
+        cursor = connection.execute(
+            f"UPDATE knowledge SET {assignments} WHERE id=?",
+            (*changes.values(), knowledge_id),
+        )
         if not cursor.rowcount:
             raise StorageError("Знание не найдено")
-        return dict(connection.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+        return dict(
+            connection.execute(
+                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone()
+        )
 
 
-def search_knowledge(query: str, *, category: str | None = None, technology: str | None = None,
-                     status: str | None = "approved", namespace: str | None = None,
-                     limit: int = 10, prompt_context: bool = False,
-                     _read_only: bool = False) -> list[dict[str, Any]]:
+def search_knowledge(
+    query: str,
+    *,
+    category: str | None = None,
+    technology: str | None = None,
+    status: str | None = "approved",
+    namespace: str | None = None,
+    limit: int = 10,
+    prompt_context: bool = False,
+    _read_only: bool = False,
+) -> list[dict[str, Any]]:
     """Ищет знания через FTS5 с безопасным резервным поиском LIKE."""
     if _read_only:
         if not current_database_path().is_file():
@@ -371,31 +527,120 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
     tokens = re.findall(r"[\w-]+", query)
     if prompt_context:
         stop_words = {
-            "about", "after", "again", "also", "and", "are", "can", "could", "does",
-            "find", "from", "have", "help", "into", "just", "more", "most", "need", "please",
-            "search", "should", "show", "some", "that", "their", "them", "then", "there",
-            "these", "this", "those",
-            "through", "very", "want", "what", "when", "where", "which", "with", "would",
-            "надо", "есть", "для", "как", "мне", "нас", "нам", "наш", "наша", "наше",
-            "наши", "это", "этот", "эта", "эти", "чтобы", "когда", "какой", "какая",
-            "какие", "можно", "нужно", "пожалуйста", "покажи", "проверь", "сделай",
+            "about",
+            "after",
+            "again",
+            "also",
+            "and",
+            "are",
+            "can",
+            "could",
+            "does",
+            "find",
+            "from",
+            "have",
+            "help",
+            "into",
+            "just",
+            "more",
+            "most",
+            "need",
+            "please",
+            "search",
+            "should",
+            "show",
+            "some",
+            "that",
+            "their",
+            "them",
+            "then",
+            "there",
+            "these",
+            "this",
+            "those",
+            "through",
+            "very",
+            "want",
+            "what",
+            "when",
+            "where",
+            "which",
+            "with",
+            "would",
+            "надо",
+            "есть",
+            "для",
+            "как",
+            "мне",
+            "нас",
+            "нам",
+            "наш",
+            "наша",
+            "наше",
+            "наши",
+            "это",
+            "этот",
+            "эта",
+            "эти",
+            "чтобы",
+            "когда",
+            "какой",
+            "какая",
+            "какие",
+            "можно",
+            "нужно",
+            "пожалуйста",
+            "покажи",
+            "проверь",
+            "сделай",
         }
-        tokens = list(dict.fromkeys(
-            token for token in tokens
-            if len(token) >= 3 and token.casefold() not in stop_words
-        ))[:8]
+        tokens = list(
+            dict.fromkeys(
+                token
+                for token in tokens
+                if len(token) >= 3 and token.casefold() not in stop_words
+            )
+        )[:8]
         if not tokens:
             return []
-    with _connect(read_only=_read_only, timeout=1.0 if _read_only else 10.0) as connection:
+    with _connect(
+        read_only=_read_only, timeout=1.0 if _read_only else 10.0
+    ) as connection:
+        if namespace is not None:
+            namespace_clauses = ["namespace=?"]
+            namespace_params: list[Any] = [namespace]
+            if status is not None:
+                namespace_clauses.append("status=?")
+                namespace_params.append(status)
+            exists = connection.execute(
+                "SELECT 1 FROM knowledge WHERE "
+                + " AND ".join(namespace_clauses)
+                + " LIMIT 1",
+                namespace_params,
+            ).fetchone()
+            if exists is None:
+                return []
         if tokens:
             try:
                 operators = (" AND ", " OR ") if prompt_context else (" AND ",)
                 matches: list[dict[str, Any]] = []
                 seen_ids: set[int] = set()
                 for operator in operators:
-                    match = operator.join(
-                        '"' + token.replace('"', '""') + '"*' for token in tokens
-                    )
+                    token_matches = []
+                    for token in tokens:
+                        quoted_token = '"' + token.replace('"', '""') + '"*'
+                        if prompt_context:
+                            text_fields = ("title", "content", "category")
+                            token_matches.append(
+                                "("
+                                + " OR ".join(
+                                    f"{field} : {quoted_token}" for field in text_fields
+                                )
+                                + ")"
+                            )
+                        else:
+                            token_matches.append(quoted_token)
+                    match = operator.join(token_matches)
                     rows = connection.execute(
                         f"SELECT k.*,bm25(knowledge_fts,4.0,1.0,2.0,3.0) AS rank FROM knowledge_fts JOIN knowledge k ON k.id=knowledge_fts.rowid WHERE knowledge_fts MATCH ? AND {filters} ORDER BY rank LIMIT ?",
                         (match, *params, limit),
@@ -415,13 +660,15 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
                 token.replace("!", "!!").replace("%", "!%").replace("_", "!_")
                 for token in tokens
             ]
-            matches: list[dict[str, Any]] = []
-            seen_ids: set[int] = set()
-            score_terms = [
-                "(k.title LIKE ? ESCAPE '!' OR k.content LIKE ? ESCAPE '!' "
-                "OR k.category LIKE ? ESCAPE '!' OR k.technology LIKE ? ESCAPE '!')"
-                for _ in escaped_tokens
-            ]
+            fallback_matches: list[dict[str, Any]] = []
+            fallback_seen_ids: set[int] = set()
+            text_fields = ("title", "content", "category")
+            text_match = (
+                "("
+                + " OR ".join(f"k.{field} LIKE ? ESCAPE '!'" for field in text_fields)
+                + ")"
+            )
+            score_terms = [text_match for _ in escaped_tokens]
             term_score = " + ".join(
                 f"CASE WHEN {term} THEN 1 ELSE 0 END" for term in score_terms
             )
@@ -430,15 +677,12 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
                 for _ in escaped_tokens
             )
             score_params = tuple(
-                pattern for token in escaped_tokens
-                for pattern in (f"%{token}%",) * 4
+                pattern
+                for token in escaped_tokens
+                for pattern in (f"%{token}%",) * len(text_fields)
             ) + tuple(f"%{token}%" for token in escaped_tokens)
             for operator in (" AND ", " OR "):
-                term_clauses = [
-                    "(k.title LIKE ? ESCAPE '!' OR k.content LIKE ? ESCAPE '!' "
-                    "OR k.category LIKE ? ESCAPE '!' OR k.technology LIKE ? ESCAPE '!')"
-                    for _ in escaped_tokens
-                ]
+                term_clauses = [text_match for _ in escaped_tokens]
                 rows = connection.execute(
                     f"SELECT k.* FROM knowledge k WHERE ({operator.join(term_clauses)}) "
                     f"AND {filters} ORDER BY ({term_score}) DESC, "
@@ -446,16 +690,17 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
                     tuple(
                         pattern
                         for token in escaped_tokens
-                        for pattern in (f"%{token}%",) * 4
-                    ) + (*params, *score_params, limit),
+                        for pattern in (f"%{token}%",) * len(text_fields)
+                    )
+                    + (*params, *score_params, limit),
                 ).fetchall()
                 for row in rows:
-                    if row["id"] not in seen_ids:
-                        matches.append(dict(row))
-                        seen_ids.add(row["id"])
+                    if row["id"] not in fallback_seen_ids:
+                        fallback_matches.append(dict(row))
+                        fallback_seen_ids.add(row["id"])
                 if len(matches) >= limit:
                     break
-            return matches[:limit]
+            return fallback_matches[:limit]
 
         escaped_query = query.replace("!", "!!").replace("%", "!%").replace("_", "!_")
         pattern = f"%{escaped_query}%"
@@ -467,7 +712,10 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
 
 
 def _set_status(
-    knowledge_id: int, status: str, *, reason: str | None = None,
+    knowledge_id: int,
+    status: str,
+    *,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Меняет статус знания и атомарно записывает решение в журнал."""
     if status not in STATUSES:
@@ -479,15 +727,19 @@ def _set_status(
     with _connect() as connection:
         row = connection.execute(
             "SELECT status,source_type,source_reference,namespace "
-            "FROM knowledge WHERE id=?", (knowledge_id,),
+            "FROM knowledge WHERE id=?",
+            (knowledge_id,),
         ).fetchone()
         if not row:
             raise StorageError("Знание не найдено")
         previous_status = str(row["status"])
         if previous_status == status:
-            return dict(connection.execute(
-                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,),
-            ).fetchone())
+            return dict(
+                connection.execute(
+                    "SELECT * FROM knowledge WHERE id=?",
+                    (knowledge_id,),
+                ).fetchone()
+            )
         connection.execute(
             "UPDATE knowledge SET status=?,updated_at=?,approved_at=? WHERE id=?",
             (status, now, now if status == "approved" else None, knowledge_id),
@@ -497,28 +749,45 @@ def _set_status(
         if reference.startswith("event:"):
             event_ids.append(reference.removeprefix("event:"))
         elif row["source_type"] == "cross_project_learning":
-            event_ids.extend(item["event_id"] for item in connection.execute(
-                "SELECT event_id FROM learning_corroborations "
-                "WHERE global_knowledge_id=? ORDER BY created_at",
-                (knowledge_id,),
-            ).fetchall())
+            event_ids.extend(
+                item["event_id"]
+                for item in connection.execute(
+                    "SELECT event_id FROM learning_corroborations "
+                    "WHERE global_knowledge_id=? ORDER BY created_at",
+                    (knowledge_id,),
+                ).fetchall()
+            )
         if not event_ids:
             event_ids.append(f"knowledge:{knowledge_id}")
-        details = json.dumps({
-            "source_type": row["source_type"],
-            "source_reference": reference,
-            "namespace": row["namespace"],
-            "reason": reason,
-        }, ensure_ascii=False)
+        details = json.dumps(
+            {
+                "source_type": row["source_type"],
+                "source_reference": reference,
+                "namespace": row["namespace"],
+                "reason": reason,
+            },
+            ensure_ascii=False,
+        )
         for event_id in dict.fromkeys(event_ids):
             connection.execute(
                 "INSERT INTO learning_event_audit "
                 "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
                 "VALUES(?,?,?,?,?,?,?)",
-                (event_id, knowledge_id, "knowledge_status_changed", previous_status,
-                 status, now, details),
+                (
+                    event_id,
+                    knowledge_id,
+                    "knowledge_status_changed",
+                    previous_status,
+                    status,
+                    now,
+                    details,
+                ),
             )
-        return dict(connection.execute("SELECT * FROM knowledge WHERE id=?", (knowledge_id,)).fetchone())
+        return dict(
+            connection.execute(
+                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone()
+        )
 
 
 def approve_knowledge(knowledge_id: int) -> dict[str, Any]:
@@ -527,7 +796,9 @@ def approve_knowledge(knowledge_id: int) -> dict[str, Any]:
 
 
 def reject_knowledge(
-    knowledge_id: int, *, reason: str | None = None,
+    knowledge_id: int,
+    *,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Отклоняет запись явным действием владельца."""
     return _set_status(knowledge_id, "rejected", reason=reason)
@@ -538,8 +809,15 @@ def deprecate_knowledge(knowledge_id: int) -> dict[str, Any]:
     return _set_status(knowledge_id, "deprecated")
 
 
-def add_evidence(knowledge_id: int, *, kind: str, result: str, source: str = "",
-                 limitations: str = "", confidence: float = 0.5) -> int:
+def add_evidence(
+    knowledge_id: int,
+    *,
+    kind: str,
+    result: str,
+    source: str = "",
+    limitations: str = "",
+    confidence: float = 0.5,
+) -> int:
     """Прикрепляет проверяемое свидетельство к записи знания."""
     if not 0 <= confidence <= 1:
         raise StorageError("confidence должен быть от 0 до 1")
@@ -547,21 +825,38 @@ def add_evidence(knowledge_id: int, *, kind: str, result: str, source: str = "",
     with _connect() as connection:
         cursor = connection.execute(
             "INSERT INTO evidence(knowledge_id,kind,result,source,checked_at,limitations,confidence) VALUES(?,?,?,?,?,?,?)",
-            (knowledge_id, _validate_text(kind,"kind",100), _validate_text(result,"result",1000), source[:2000],
-             datetime.now(UTC).isoformat(), limitations[:2000], confidence),
+            (
+                knowledge_id,
+                _validate_text(kind, "kind", 100),
+                _validate_text(result, "result", 1000),
+                source[:2000],
+                datetime.now(UTC).isoformat(),
+                limitations[:2000],
+                confidence,
+            ),
         )
-        return int(cursor.lastrowid)
+        return _last_insert_id(cursor)
 
 
 def ingest_task_event(event: dict[str, Any]) -> dict[str, Any]:
     """Сохраняет обезличенное событие, не принимая его за доказательство проверки."""
     init_database()
-    required = {"event_id", "project_id", "task_id", "client_name", "task_description", "outcome", "completed_at"}
+    required = {
+        "event_id",
+        "project_id",
+        "task_id",
+        "client_name",
+        "task_description",
+        "outcome",
+        "completed_at",
+    }
     if missing := required - event.keys():
         raise StorageError("Не заданы обязательные поля: " + ", ".join(sorted(missing)))
     status = event.get("status", "task_completed")
     if not isinstance(status, str) or status not in {
-        "session_finished", "task_completed", "task_verified",
+        "session_finished",
+        "task_completed",
+        "task_verified",
     }:
         raise StorageError("Недопустимый статус события")
     test_results = event.get("test_results", {})
@@ -589,9 +884,15 @@ def ingest_task_event(event: dict[str, Any]) -> dict[str, Any]:
     safe_completed_at = parsed_completed_at.astimezone(UTC).isoformat()
     # Caller-supplied descriptions, outcomes, files, and test output are not evidence.
     values = (
-        identifiers["event_id"], identifiers["project_id"], identifiers["task_id"],
-        "MCP", "Unverified task event", "[]", "{}",
-        "Awaiting local verification", safe_completed_at,
+        identifiers["event_id"],
+        identifiers["project_id"],
+        identifiers["task_id"],
+        "MCP",
+        "Unverified task event",
+        "[]",
+        "{}",
+        "Awaiting local verification",
+        safe_completed_at,
     )
     with _connect() as connection:
         connection.execute(
@@ -601,16 +902,26 @@ def ingest_task_event(event: dict[str, Any]) -> dict[str, Any]:
             "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (*values, None, "waiting_for_verification"),
         )
-        row = connection.execute("SELECT * FROM task_events WHERE event_id=?", (values[0],)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM task_events WHERE event_id=?", (values[0],)
+        ).fetchone()
         return dict(row)
 
 
-def record_verified_task(event: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+def record_verified_task(
+    event: dict[str, Any], verification: dict[str, Any]
+) -> dict[str, Any]:
     """Записывает локально выполненную проверку и связанное событие очереди."""
     init_database()
     required = {
-        "verification_id", "verification_type", "exit_code", "started_at",
-        "completed_at", "artifact_digest", "command_digest", "verifier",
+        "verification_id",
+        "verification_type",
+        "exit_code",
+        "started_at",
+        "completed_at",
+        "artifact_digest",
+        "command_digest",
+        "verifier",
     }
     if missing := required - verification.keys():
         raise StorageError("Не заданы поля проверки: " + ", ".join(sorted(missing)))
@@ -619,18 +930,21 @@ def record_verified_task(event: dict[str, Any], verification: dict[str, Any]) ->
     project_id = _validate_text(event.get("project_id", ""), "project_id", 200)
     raw_fingerprint = verification.get("project_fingerprint")
     project_fingerprint = (
-        None if raw_fingerprint is None
+        None
+        if raw_fingerprint is None
         else _validate_text(str(raw_fingerprint), "project_fingerprint", 80)
     )
     if project_fingerprint is not None and not re.fullmatch(
-        r"origin-v2:[a-f0-9]{64}", project_fingerprint
+        r"origin-v3:[a-f0-9]{64}", project_fingerprint
     ):
         raise StorageError("Некорректный отпечаток проекта")
     task_id = _validate_text(event.get("task_id", ""), "task_id", 200)
     if event.get("status") != "task_verified" or int(verification["exit_code"]) != 0:
         raise StorageError("Проверенное событие требует успешный локальный процесс")
     event_id = _validate_text(event.get("event_id", ""), "event_id", 200)
-    task_description = _validate_text(event.get("task_description", ""), "task_description", 1000)
+    task_description = _validate_text(
+        event.get("task_description", ""), "task_description", 1000
+    )
     completed_at = _validate_text(event.get("completed_at", ""), "completed_at", 100)
     verification_result = event.get("verification_result")
     if verification_result is None:
@@ -688,19 +1002,32 @@ def record_verified_task(event: dict[str, Any], verification: dict[str, Any]) ->
             "test_results,outcome,completed_at,status,verification_id,project_fingerprint) "
             "VALUES(?,?,?,?,?,?,?,?,?,'pending_analysis',?,?)",
             (
-                event_id, project_id, task_id, "Codex", task_description,
+                event_id,
+                project_id,
+                task_id,
+                "Codex",
+                task_description,
                 json.dumps(event.get("changed_files", []), ensure_ascii=False),
                 json.dumps(verification_result, ensure_ascii=False),
-                "Locally verified command completed successfully", completed_at,
-                verification_values[0], project_fingerprint,
+                "Locally verified command completed successfully",
+                completed_at,
+                verification_values[0],
+                project_fingerprint,
             ),
         )
         if inserted.rowcount:
             connection.execute(
                 "INSERT INTO learning_event_audit "
                 "(event_id,action,status_to,occurred_at,details) VALUES(?,?,?,?,?)",
-                (event_id, "verified_event_created", "pending_analysis", completed_at,
-                 json.dumps({"verification_id": verification_values[0]}, ensure_ascii=False)),
+                (
+                    event_id,
+                    "verified_event_created",
+                    "pending_analysis",
+                    completed_at,
+                    json.dumps(
+                        {"verification_id": verification_values[0]}, ensure_ascii=False
+                    ),
+                ),
             )
         row = connection.execute(
             "SELECT * FROM task_events WHERE event_id=?", (event_id,)
@@ -708,8 +1035,9 @@ def record_verified_task(event: dict[str, Any], verification: dict[str, Any]) ->
         return dict(row)
 
 
-def record_failed_verification(*, project_id: str, task_id: str,
-                               verification: dict[str, Any]) -> str:
+def record_failed_verification(
+    *, project_id: str, task_id: str, verification: dict[str, Any]
+) -> str:
     """Фиксирует только метаданные неуспешного локального запуска."""
     init_database()
     verification_id = _validate_text(
@@ -720,11 +1048,12 @@ def record_failed_verification(*, project_id: str, task_id: str,
         raise StorageError("Недопустимый тип неуспешной проверки")
     raw_fingerprint = verification.get("project_fingerprint")
     project_fingerprint = (
-        None if raw_fingerprint is None
+        None
+        if raw_fingerprint is None
         else _validate_text(str(raw_fingerprint), "project_fingerprint", 80)
     )
     if project_fingerprint is not None and not re.fullmatch(
-        r"origin-v2:[a-f0-9]{64}", project_fingerprint
+        r"origin-v3:[a-f0-9]{64}", project_fingerprint
     ):
         raise StorageError("Некорректный отпечаток проекта")
     with _connect() as connection:
@@ -733,15 +1062,22 @@ def record_failed_verification(*, project_id: str, task_id: str,
             "(verification_id,project_id,task_id,verification_type,exit_code,started_at,"
             "completed_at,artifact_digest,command_digest,verifier,trust_status,project_fingerprint) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (verification_id, _validate_text(project_id, "project_id", 200),
-             _validate_text(task_id, "task_id", 200),
-             verification_type,
-             int(verification["exit_code"]), str(verification["started_at"]),
-             str(verification["completed_at"]), str(verification["artifact_digest"]),
-             str(verification["command_digest"]), "ai-memory-cli",
-             "trusted_local_launcher" if verification_type == "command_launch"
-             else "trusted_local_process",
-             project_fingerprint),
+            (
+                verification_id,
+                _validate_text(project_id, "project_id", 200),
+                _validate_text(task_id, "task_id", 200),
+                verification_type,
+                int(verification["exit_code"]),
+                str(verification["started_at"]),
+                str(verification["completed_at"]),
+                str(verification["artifact_digest"]),
+                str(verification["command_digest"]),
+                "ai-memory-cli",
+                "trusted_local_launcher"
+                if verification_type == "command_launch"
+                else "trusted_local_process",
+                project_fingerprint,
+            ),
         )
     return verification_id
 
@@ -755,7 +1091,8 @@ def list_learning_events(*, limit: int = 100) -> list[dict[str, Any]]:
         rows = connection.execute(
             "SELECT event_id,project_id,task_id,status,attempt_count,completed_at,"
             "analyzed_at,last_error_type,verification_id FROM task_events "
-            "ORDER BY completed_at DESC LIMIT ?", (limit,),
+            "ORDER BY completed_at DESC LIMIT ?",
+            (limit,),
         )
         return [dict(row) for row in rows]
 
@@ -771,8 +1108,9 @@ def get_verification(verification_id: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
-def list_verification_attempts(*, limit: int = 20,
-                               failed_only: bool = True) -> list[dict[str, Any]]:
+def list_verification_attempts(
+    *, limit: int = 20, failed_only: bool = True
+) -> list[dict[str, Any]]:
     """Показывает последние проверки без команд, вывода и абсолютных путей."""
     init_database()
     if not 1 <= limit <= 100:
@@ -811,12 +1149,12 @@ def get_learning_corroboration(knowledge_id: int) -> dict[str, Any]:
             (knowledge_id,),
         ).fetchall()
         counts = connection.execute(
-            "SELECT COUNT(DISTINCT CASE WHEN project_fingerprint LIKE 'origin-v2:%' "
+            "SELECT COUNT(DISTINCT CASE WHEN project_fingerprint LIKE 'origin-v3:%' "
             "THEN project_fingerprint END) AS independent_count, "
             "COALESCE(SUM(CASE WHEN project_fingerprint IS NULL THEN 1 ELSE 0 END), 0) "
             "AS legacy_count, "
             "COALESCE(SUM(CASE WHEN project_fingerprint IS NOT NULL "
-            "AND project_fingerprint NOT LIKE 'origin-v2:%' THEN 1 ELSE 0 END), 0) "
+            "AND project_fingerprint NOT LIKE 'origin-v3:%' THEN 1 ELSE 0 END), 0) "
             "AS legacy_identity_count "
             "FROM learning_corroborations WHERE global_knowledge_id=?",
             (knowledge_id,),
@@ -846,9 +1184,16 @@ def _verification_evidence_text(rationale: str, verification_id: str) -> str:
 
 
 def create_codex_learning_candidate(
-    *, verification_id: str, category: str, title: str, content: str,
-    rationale: str, limitations: str, confidence: float,
-    evidence_refs: list[str], analysis_json: str,
+    *,
+    verification_id: str,
+    category: str,
+    title: str,
+    content: str,
+    rationale: str,
+    limitations: str,
+    confidence: float,
+    evidence_refs: list[str],
+    analysis_json: str,
 ) -> dict[str, Any]:
     """Создаёт project-кандидат; global-кандидат требует ссылки на файлы из разных проектов."""
     init_database()
@@ -860,13 +1205,19 @@ def create_codex_learning_candidate(
     verification_id = _validate_text(verification_id, "verification_id", 64)
     if not re.fullmatch(r"[a-f0-9]{64}", verification_id):
         raise StorageError("Некорректный verification_id")
-    if not 0 <= confidence <= 1 or not isinstance(evidence_refs, list) or not evidence_refs:
+    if (
+        not 0 <= confidence <= 1
+        or not isinstance(evidence_refs, list)
+        or not evidence_refs
+    ):
         raise StorageError("Некорректная confidence или evidence_refs")
     if len(analysis_json) > 8_000:
         raise StorageError("Слишком большой структурированный вывод")
     now = datetime.now(UTC).isoformat()
     digest = hashlib.sha256(
-        (category.casefold() + "\0" + title.casefold() + "\0" + content.casefold()).encode()
+        (
+            category.casefold() + "\0" + title.casefold() + "\0" + content.casefold()
+        ).encode()
     ).hexdigest()
     with _connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -879,7 +1230,8 @@ def create_codex_learning_candidate(
             (verification_id,),
         ).fetchone()
         if (
-            not row or row["exit_code"] != 0
+            not row
+            or row["exit_code"] != 0
             or row["trust_status"] != "trusted_local_process"
             or not re.fullmatch(r"project:[a-f0-9]{16}", row["project_id"])
         ):
@@ -889,7 +1241,8 @@ def create_codex_learning_candidate(
         event_id = row["event_id"]
         existing_for_event = connection.execute(
             "SELECT id,status,namespace FROM knowledge WHERE source_type='learning_engine' "
-            "AND source_reference=?", (f"event:{event_id}",),
+            "AND source_reference=?",
+            (f"event:{event_id}",),
         ).fetchone()
         if existing_for_event:
             return {
@@ -920,9 +1273,13 @@ def create_codex_learning_candidate(
                     raise StorageError("Ссылка на другую проверку запрещена")
             elif reference.startswith("file:"):
                 if reference[5:] not in project_files:
-                    raise StorageError("Файл evidence отсутствует среди проверенных файлов")
+                    raise StorageError(
+                        "Файл evidence отсутствует среди проверенных файлов"
+                    )
             else:
-                raise StorageError("Допустимы только ссылки на verification и changed files")
+                raise StorageError(
+                    "Допустимы только ссылки на verification и changed files"
+                )
 
         proposed_tokens = _lesson_tokens(title + " " + content)
         matches: list[tuple[float, sqlite3.Row]] = []
@@ -941,7 +1298,9 @@ def create_codex_learning_candidate(
             "ORDER BY k.id DESC LIMIT 10_000",
         ).fetchall()
         for candidate in rows:
-            existing_tokens = _lesson_tokens(candidate["title"] + " " + candidate["content"])
+            existing_tokens = _lesson_tokens(
+                candidate["title"] + " " + candidate["content"]
+            )
             if candidate["content_hash"] == digest:
                 matches.append((1.0, candidate))
                 continue
@@ -957,59 +1316,87 @@ def create_codex_learning_candidate(
             (score, item) for score, item in matches if item["namespace"] == namespace
         ]
         cross_project_matches = [
-            (score, item) for score, item in matches
+            (score, item)
+            for score, item in matches
             if item["namespace"].startswith("project:")
             and item["namespace"] != namespace
             and item["source_type"] == "learning_engine"
             and item["has_file_evidence"]
             and bool(json.loads(item["project_changed_files"] or "[]"))
             and isinstance(current_fingerprint, str)
-            and current_fingerprint.startswith("origin-v2:")
+            and current_fingerprint.startswith("origin-v3:")
             and isinstance(item["project_fingerprint"], str)
-            and item["project_fingerprint"].startswith("origin-v2:")
+            and item["project_fingerprint"].startswith("origin-v3:")
             and item["project_fingerprint"] != current_fingerprint
         ]
         same_project_matches = [
-            (score, item) for score, item in matches
+            (score, item)
+            for score, item in matches
             if item["source_type"] == "learning_engine"
             and item["namespace"] != namespace
             and isinstance(current_fingerprint, str)
-            and current_fingerprint.startswith("origin-v2:")
+            and current_fingerprint.startswith("origin-v3:")
             and item["project_fingerprint"] == current_fingerprint
         ]
 
         def add_corroboration(
-            global_id: int, project_knowledge_id: int | None,
-            support_namespace: str, support_event_id: str,
-            support_verification_id: str, support_fingerprint: str | None,
+            global_id: int,
+            project_knowledge_id: int | None,
+            support_namespace: str,
+            support_event_id: str,
+            support_verification_id: str,
+            support_fingerprint: str | None,
         ) -> bool:
-            inserted = connection.execute(
-                "INSERT OR IGNORE INTO learning_corroborations "
-                "(global_knowledge_id,project_knowledge_id,project_namespace,event_id,"
-                "verification_id,created_at,project_fingerprint) VALUES(?,?,?,?,?,?,?)",
-                (global_id, project_knowledge_id, support_namespace, support_event_id,
-                 support_verification_id, now, support_fingerprint),
-            ).rowcount == 1
+            inserted = (
+                connection.execute(
+                    "INSERT OR IGNORE INTO learning_corroborations "
+                    "(global_knowledge_id,project_knowledge_id,project_namespace,event_id,"
+                    "verification_id,created_at,project_fingerprint) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        global_id,
+                        project_knowledge_id,
+                        support_namespace,
+                        support_event_id,
+                        support_verification_id,
+                        now,
+                        support_fingerprint,
+                    ),
+                ).rowcount
+                == 1
+            )
             if inserted:
                 connection.execute(
                     "INSERT INTO evidence "
                     "(knowledge_id,kind,result,source,checked_at,limitations,confidence) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (global_id, "independent_project_verification",
-                     "Lesson independently observed in another verified project context.",
-                     f"event:{support_event_id}; verification:{support_verification_id}",
-                     now, "Project identity is stored only as one-way namespace and repository hashes.",
-                     confidence),
+                    (
+                        global_id,
+                        "independent_project_verification",
+                        "Lesson independently observed in another verified project context.",
+                        f"event:{support_event_id}; verification:{support_verification_id}",
+                        now,
+                        "Project identity is stored only as one-way namespace and repository hashes.",
+                        confidence,
+                    ),
                 )
                 connection.execute(
                     "INSERT INTO learning_event_audit "
                     "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (support_event_id, global_id, "cross_project_corroboration_added",
-                     None, None, now, json.dumps({
-                         "global_knowledge_id": global_id,
-                         "project_namespace": support_namespace,
-                     })),
+                    (
+                        support_event_id,
+                        global_id,
+                        "cross_project_corroboration_added",
+                        None,
+                        None,
+                        now,
+                        json.dumps(
+                            {
+                                "global_knowledge_id": global_id,
+                                "project_namespace": support_namespace,
+                            }
+                        ),
+                    ),
                 )
             return inserted
 
@@ -1019,39 +1406,62 @@ def create_codex_learning_candidate(
         if duplicate_matches:
             _, duplicate = max(duplicate_matches, key=lambda item: item[0])
             if (
-                global_matches and has_current_file_evidence
+                global_matches
+                and has_current_file_evidence
                 and isinstance(current_fingerprint, str)
-                and current_fingerprint.startswith("origin-v2:")
+                and current_fingerprint.startswith("origin-v3:")
             ):
                 global_id = int(max(global_matches, key=lambda item: item[0])[1]["id"])
-                existing_local_id = int(local_matches[0][1]["id"]) if local_matches else None
+                existing_local_id = (
+                    int(local_matches[0][1]["id"]) if local_matches else None
+                )
                 add_corroboration(
-                    global_id, existing_local_id, namespace, event_id, verification_id,
+                    global_id,
+                    existing_local_id,
+                    namespace,
+                    event_id,
+                    verification_id,
                     current_fingerprint,
                 )
             connection.execute(
                 "UPDATE task_events SET status='no_insight',analysis=?,analyzed_at=?,locked_at=NULL "
-                "WHERE event_id=?", (analysis_json, now, event_id),
+                "WHERE event_id=?",
+                (analysis_json, now, event_id),
             )
             connection.execute(
                 "INSERT INTO learning_event_audit "
                 "(event_id,action,status_from,status_to,occurred_at,details) VALUES(?,?,?,?,?,?)",
-                (event_id, "candidate_duplicate_skipped", row["status"], "no_insight", now,
-                 json.dumps({"matched_knowledge_id": duplicate["id"],
-                             "matched_namespace": duplicate["namespace"],
-                             "namespace": namespace}, ensure_ascii=False)),
+                (
+                    event_id,
+                    "candidate_duplicate_skipped",
+                    row["status"],
+                    "no_insight",
+                    now,
+                    json.dumps(
+                        {
+                            "matched_knowledge_id": duplicate["id"],
+                            "matched_namespace": duplicate["namespace"],
+                            "namespace": namespace,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
             )
             corroborations = 0
             if global_matches:
-                corroborations = int(connection.execute(
-                    "SELECT COUNT(DISTINCT project_fingerprint) "
-                    "FROM learning_corroborations WHERE global_knowledge_id=? "
-                    "AND project_fingerprint LIKE 'origin-v2:%'",
-                    (global_id,),
-                ).fetchone()[0])
+                corroborations = int(
+                    connection.execute(
+                        "SELECT COUNT(DISTINCT project_fingerprint) "
+                        "FROM learning_corroborations WHERE global_knowledge_id=? "
+                        "AND project_fingerprint LIKE 'origin-v3:%'",
+                        (global_id,),
+                    ).fetchone()[0]
+                )
             return {
-                "knowledge_id": duplicate["id"], "status": "duplicate_skipped",
-                "namespace": namespace, "event_id": event_id,
+                "knowledge_id": duplicate["id"],
+                "status": "duplicate_skipped",
+                "namespace": namespace,
+                "event_id": event_id,
                 "verification_id": verification_id,
                 "global_candidate_id": global_id if global_matches else None,
                 "independent_project_count": corroborations,
@@ -1061,65 +1471,121 @@ def create_codex_learning_candidate(
             "INSERT INTO knowledge (uuid,category,title,content,status,source_type,"
             "source_reference,technology,confidence,namespace,updated_at,content_hash,publishable) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
-            (str(uuid.uuid4()), category, title, content, "candidate", "learning_engine",
-             f"event:{event_id}", "", confidence, namespace, now, digest),
+            (
+                str(uuid.uuid4()),
+                category,
+                title,
+                content,
+                "candidate",
+                "learning_engine",
+                f"event:{event_id}",
+                "",
+                confidence,
+                namespace,
+                now,
+                digest,
+            ),
         )
-        knowledge_id = int(cursor.lastrowid)
+        knowledge_id = _last_insert_id(cursor)
         evidence_result = _verification_evidence_text(rationale, verification_id)
         connection.execute(
             "INSERT INTO evidence (knowledge_id,kind,result,source,checked_at,limitations,confidence) "
             "VALUES(?,?,?,?,?,?,?)",
-            (knowledge_id, "local_process_verification", evidence_result[:1_000],
-             "; ".join([f"event:{event_id}", *evidence_refs])[:2_000], now,
-             limitations, confidence),
+            (
+                knowledge_id,
+                "local_process_verification",
+                evidence_result[:1_000],
+                "; ".join([f"event:{event_id}", *evidence_refs])[:2_000],
+                now,
+                limitations,
+                confidence,
+            ),
         )
         connection.execute(
             "UPDATE task_events SET status='candidate_created',analysis=?,analyzed_at=?,locked_at=NULL "
-            "WHERE event_id=?", (analysis_json, now, event_id),
+            "WHERE event_id=?",
+            (analysis_json, now, event_id),
         )
         connection.execute(
             "INSERT INTO learning_event_audit "
             "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
             "VALUES(?,?,?,?,?,?,?)",
-            (event_id, knowledge_id, "candidate_created", row["status"],
-             "candidate_created", now, json.dumps({
-                 "namespace": namespace, "verification_id": verification_id,
-                 "evidence_refs": evidence_refs,
-             }, ensure_ascii=False)),
+            (
+                event_id,
+                knowledge_id,
+                "candidate_created",
+                row["status"],
+                "candidate_created",
+                now,
+                json.dumps(
+                    {
+                        "namespace": namespace,
+                        "verification_id": verification_id,
+                        "evidence_refs": evidence_refs,
+                    },
+                    ensure_ascii=False,
+                ),
+            ),
         )
 
         global_candidate_id: int | None = None
         independent_project_count = 0
         if cross_project_matches and has_current_file_evidence:
-            project_candidates: dict[str, sqlite3.Row] = {current_fingerprint: connection.execute(
-                "SELECT k.id,k.namespace,k.source_reference,v.project_fingerprint "
-                "FROM knowledge k JOIN task_events e "
-                "ON e.event_id=substr(k.source_reference,7) "
-                "JOIN verification_records v ON v.verification_id=e.verification_id "
-                "WHERE k.id=?",
-                (knowledge_id,),
-            ).fetchone()}
+            project_candidates: dict[str, sqlite3.Row] = {
+                current_fingerprint: connection.execute(
+                    "SELECT k.id,k.namespace,k.source_reference,v.project_fingerprint "
+                    "FROM knowledge k JOIN task_events e "
+                    "ON e.event_id=substr(k.source_reference,7) "
+                    "JOIN verification_records v ON v.verification_id=e.verification_id "
+                    "WHERE k.id=?",
+                    (knowledge_id,),
+                ).fetchone()
+            }
             for _, matched in cross_project_matches:
                 project_candidates.setdefault(matched["project_fingerprint"], matched)
             if len(project_candidates) >= 2:
-                rollup_key = "corroborated:" + hashlib.sha256(
-                    "|".join(str(item["id"]) for item in sorted(
-                        project_candidates.values(), key=lambda value: value["id"]
-                    )).encode()
-                ).hexdigest()
+                rollup_key = (
+                    "corroborated:"
+                    + hashlib.sha256(
+                        "|".join(
+                            str(item["id"])
+                            for item in sorted(
+                                project_candidates.values(),
+                                key=lambda value: value["id"],
+                            )
+                        ).encode()
+                    ).hexdigest()
+                )
                 rollup_hash = hashlib.sha256(
-                    (category.casefold() + "\0" + title.casefold() + "\0" + content.casefold()).encode()
+                    (
+                        category.casefold()
+                        + "\0"
+                        + title.casefold()
+                        + "\0"
+                        + content.casefold()
+                    ).encode()
                 ).hexdigest()
                 cursor = connection.execute(
                     "INSERT INTO knowledge "
                     "(uuid,category,title,content,status,source_type,source_reference,technology,"
                     "confidence,namespace,updated_at,content_hash,publishable) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
-                    (str(uuid.uuid4()), category, title, content, "candidate",
-                     "cross_project_learning", rollup_key, "", confidence, "global", now,
-                     rollup_hash),
+                    (
+                        str(uuid.uuid4()),
+                        category,
+                        title,
+                        content,
+                        "candidate",
+                        "cross_project_learning",
+                        rollup_key,
+                        "",
+                        confidence,
+                        "global",
+                        now,
+                        rollup_hash,
+                    ),
                 )
-                global_candidate_id = int(cursor.lastrowid)
+                global_candidate_id = _last_insert_id(cursor)
                 for support_fingerprint, source_candidate in project_candidates.items():
                     support_event_id = str(source_candidate["source_reference"])[6:]
                     support_event = connection.execute(
@@ -1127,11 +1593,16 @@ def create_codex_learning_candidate(
                         (support_event_id,),
                     ).fetchone()
                     if not support_event or not support_event["verification_id"]:
-                        raise StorageError("Не найдена проверка межпроектного кандидата")
+                        raise StorageError(
+                            "Не найдена проверка межпроектного кандидата"
+                        )
                     add_corroboration(
-                        global_candidate_id, int(source_candidate["id"]),
-                        source_candidate["namespace"], support_event_id,
-                        support_event["verification_id"], support_fingerprint,
+                        global_candidate_id,
+                        int(source_candidate["id"]),
+                        source_candidate["namespace"],
+                        support_event_id,
+                        support_event["verification_id"],
+                        support_fingerprint,
                     )
                 independent_project_count = len(project_candidates)
                 for source_candidate in project_candidates.values():
@@ -1140,17 +1611,28 @@ def create_codex_learning_candidate(
                         "INSERT INTO learning_event_audit "
                         "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
                         "VALUES(?,?,?,?,?,?,?)",
-                        (support_event_id, global_candidate_id,
-                         "cross_project_candidate_created", None, "candidate", now,
-                         json.dumps({"independent_project_count": independent_project_count})),
+                        (
+                            support_event_id,
+                            global_candidate_id,
+                            "cross_project_candidate_created",
+                            None,
+                            "candidate",
+                            now,
+                            json.dumps(
+                                {"independent_project_count": independent_project_count}
+                            ),
+                        ),
                     )
         saved = connection.execute(
             "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
         ).fetchone()
         return {
-            "knowledge_id": knowledge_id, "status": saved["status"],
-            "namespace": saved["namespace"], "event_id": event_id,
-            "verification_id": verification_id, "idempotent": False,
+            "knowledge_id": knowledge_id,
+            "status": saved["status"],
+            "namespace": saved["namespace"],
+            "event_id": event_id,
+            "verification_id": verification_id,
+            "idempotent": False,
             "global_candidate_id": global_candidate_id,
             "independent_project_count": independent_project_count,
         }
@@ -1176,9 +1658,14 @@ def claim_learning_event(*, stale_after_seconds: int = 300) -> dict[str, Any] | 
                 "INSERT INTO learning_event_audit "
                 "(event_id,action,status_from,status_to,occurred_at,details) "
                 "VALUES(?,?,?,?,?,?)",
-                (row["event_id"], "processing_lease_expired", "processing",
-                 "permanent_error", now_text,
-                 json.dumps({"attempt_count": row["attempt_count"]})),
+                (
+                    row["event_id"],
+                    "processing_lease_expired",
+                    "processing",
+                    "permanent_error",
+                    now_text,
+                    json.dumps({"attempt_count": row["attempt_count"]}),
+                ),
             )
         connection.execute(
             "UPDATE task_events SET status='permanent_error',locked_at=NULL,"
@@ -1199,20 +1686,25 @@ def claim_learning_event(*, stale_after_seconds: int = 300) -> dict[str, Any] | 
         previous = row["status"]
         connection.execute(
             "UPDATE task_events SET status='processing',locked_at=?,attempt_count=attempt_count+1 "
-            "WHERE event_id=?", (now_text, row["event_id"]),
+            "WHERE event_id=?",
+            (now_text, row["event_id"]),
         )
         connection.execute(
             "INSERT INTO learning_event_audit "
             "(event_id,action,status_from,status_to,occurred_at) VALUES(?,?,?,?,?)",
             (row["event_id"], "processing_started", previous, "processing", now_text),
         )
-        result = dict(connection.execute(
-            "SELECT * FROM task_events WHERE event_id=?", (row["event_id"],)
-        ).fetchone())
+        result = dict(
+            connection.execute(
+                "SELECT * FROM task_events WHERE event_id=?", (row["event_id"],)
+            ).fetchone()
+        )
         return result
 
 
-def finish_learning_event(event_id: str, *, status: str, analysis: str | None = None) -> None:
+def finish_learning_event(
+    event_id: str, *, status: str, analysis: str | None = None
+) -> None:
     """Завершает разбор события и сохраняет только допустимый итоговый статус."""
     init_database()
     if status not in {"analysed", "no_insight", "candidate_created"}:
@@ -1236,7 +1728,9 @@ def finish_learning_event(event_id: str, *, status: str, analysis: str | None = 
         )
 
 
-def fail_learning_event(event_id: str, *, error_type: str, max_attempts: int = 3) -> str:
+def fail_learning_event(
+    event_id: str, *, error_type: str, max_attempts: int = 3
+) -> str:
     """Планирует ограниченный повтор анализа или закрывает постоянную ошибку."""
     init_database()
     now = datetime.now(UTC)
@@ -1248,9 +1742,13 @@ def fail_learning_event(event_id: str, *, error_type: str, max_attempts: int = 3
             raise StorageError("Событие обучения не найдено")
         attempts = int(row["attempt_count"])
         target = "permanent_error" if attempts >= max_attempts else "retryable_error"
-        next_attempt = None if target == "permanent_error" else datetime.fromtimestamp(
-            now.timestamp() + min(300, 2 ** attempts), UTC
-        ).isoformat()
+        next_attempt = (
+            None
+            if target == "permanent_error"
+            else datetime.fromtimestamp(
+                now.timestamp() + min(300, 2**attempts), UTC
+            ).isoformat()
+        )
         safe_error = re.sub(r"[^A-Za-z0-9_.-]", "", error_type)[:80] or "UnknownError"
         connection.execute(
             "UPDATE task_events SET status=?,locked_at=NULL,next_attempt_at=?,"
@@ -1260,8 +1758,14 @@ def fail_learning_event(event_id: str, *, error_type: str, max_attempts: int = 3
         connection.execute(
             "INSERT INTO learning_event_audit "
             "(event_id,action,status_from,status_to,occurred_at,details) VALUES(?,?,?,?,?,?)",
-            (event_id, "analysis_failed", row["status"], target, now.isoformat(),
-             json.dumps({"error_type": safe_error})),
+            (
+                event_id,
+                "analysis_failed",
+                row["status"],
+                target,
+                now.isoformat(),
+                json.dumps({"error_type": safe_error}),
+            ),
         )
         return target
 
@@ -1278,20 +1782,35 @@ def retry_learning_event(event_id: str) -> None:
             raise StorageError("Повтор доступен только для событий с ошибкой")
         connection.execute(
             "UPDATE task_events SET status='pending_analysis',next_attempt_at=NULL,"
-            "last_error_type=NULL,attempt_count=0 WHERE event_id=?", (event_id,),
+            "last_error_type=NULL,attempt_count=0 WHERE event_id=?",
+            (event_id,),
         )
         connection.execute(
             "INSERT INTO learning_event_audit "
             "(event_id,action,status_from,status_to,occurred_at,details) "
             "VALUES(?,?,?,?,?,?)",
-            (event_id, "retry_requested", row["status"], "pending_analysis", now,
-             json.dumps({"previous_attempt_count": row["attempt_count"]})),
+            (
+                event_id,
+                "retry_requested",
+                row["status"],
+                "pending_analysis",
+                now,
+                json.dumps({"previous_attempt_count": row["attempt_count"]}),
+            ),
         )
 
 
-def create_learning_candidate(event_id: str, *, category: str, title: str,
-                              content: str, rationale: str, confidence: float,
-                              namespace: str, analysis_json: str) -> dict[str, Any] | None:
+def create_learning_candidate(
+    event_id: str,
+    *,
+    category: str,
+    title: str,
+    content: str,
+    rationale: str,
+    confidence: float,
+    namespace: str,
+    analysis_json: str,
+) -> dict[str, Any] | None:
     """Создаёт только проверенный проектный кандидат и оставляет audit trail."""
     init_database()
     category = _validate_text(category, "category", 100)
@@ -1303,12 +1822,15 @@ def create_learning_candidate(event_id: str, *, category: str, title: str,
         raise StorageError("Learning candidate должен быть project-scoped")
     now = datetime.now(UTC).isoformat()
     digest = hashlib.sha256(
-        (category.casefold() + "\0" + title.casefold() + "\0" + content.casefold()).encode()
+        (
+            category.casefold() + "\0" + title.casefold() + "\0" + content.casefold()
+        ).encode()
     ).hexdigest()
     with _connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         event = connection.execute(
-            "SELECT verification_id,status FROM task_events WHERE event_id=?", (event_id,)
+            "SELECT verification_id,status FROM task_events WHERE event_id=?",
+            (event_id,),
         ).fetchone()
         if not event or not event["verification_id"]:
             raise StorageError("Learning candidate требует проверенное событие")
@@ -1316,7 +1838,11 @@ def create_learning_candidate(event_id: str, *, category: str, title: str,
             "SELECT exit_code,trust_status FROM verification_records WHERE verification_id=?",
             (event["verification_id"],),
         ).fetchone()
-        if not verification or verification["exit_code"] != 0 or verification["trust_status"] != "trusted_local_process":
+        if (
+            not verification
+            or verification["exit_code"] != 0
+            or verification["trust_status"] != "trusted_local_process"
+        ):
             raise StorageError("Доказательство локальной проверки недоступно")
         duplicate = connection.execute(
             "SELECT id FROM knowledge WHERE namespace=? AND content_hash=?",
@@ -1328,32 +1854,59 @@ def create_learning_candidate(event_id: str, *, category: str, title: str,
             "INSERT INTO knowledge (uuid,category,title,content,status,source_type,"
             "source_reference,technology,confidence,namespace,updated_at,content_hash,publishable) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0)",
-            (str(uuid.uuid4()), category, title, content, "candidate", "learning_engine",
-             f"event:{event_id}", "", confidence, namespace, now, digest),
+            (
+                str(uuid.uuid4()),
+                category,
+                title,
+                content,
+                "candidate",
+                "learning_engine",
+                f"event:{event_id}",
+                "",
+                confidence,
+                namespace,
+                now,
+                digest,
+            ),
         )
-        knowledge_id = int(cursor.lastrowid)
+        knowledge_id = _last_insert_id(cursor)
         connection.execute(
             "INSERT INTO evidence (knowledge_id,kind,result,source,checked_at,limitations,confidence) "
             "VALUES(?,?,?,?,?,?,?)",
-            (knowledge_id, "local_process_verification",
-             _verification_evidence_text(rationale, event["verification_id"])[:1000],
-             f"event:{event_id}; verification:{event['verification_id']}", now,
-             "LLM-generated candidate; requires maintainer review", confidence),
+            (
+                knowledge_id,
+                "local_process_verification",
+                _verification_evidence_text(rationale, event["verification_id"])[:1000],
+                f"event:{event_id}; verification:{event['verification_id']}",
+                now,
+                "LLM-generated candidate; requires maintainer review",
+                confidence,
+            ),
         )
         connection.execute(
             "UPDATE task_events SET status='candidate_created',analysis=?,analyzed_at=?,locked_at=NULL "
-            "WHERE event_id=?", (analysis_json, now, event_id),
+            "WHERE event_id=?",
+            (analysis_json, now, event_id),
         )
         connection.execute(
             "INSERT INTO learning_event_audit "
             "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
             "VALUES(?,?,?,?,?,?,?)",
-            (event_id, knowledge_id, "candidate_created", event["status"],
-             "candidate_created", now, json.dumps({"namespace": namespace})),
+            (
+                event_id,
+                knowledge_id,
+                "candidate_created",
+                event["status"],
+                "candidate_created",
+                now,
+                json.dumps({"namespace": namespace}),
+            ),
         )
-        return dict(connection.execute(
-            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
-        ).fetchone())
+        return dict(
+            connection.execute(
+                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone()
+        )
 
 
 def withdraw_learning_candidate(knowledge_id: int, *, reason: str) -> dict[str, Any]:
@@ -1367,8 +1920,14 @@ def withdraw_learning_candidate(knowledge_id: int, *, reason: str) -> dict[str, 
             "SELECT id,status,source_type,source_reference FROM knowledge WHERE id=?",
             (knowledge_id,),
         ).fetchone()
-        if not row or row["status"] != "candidate" or row["source_type"] != "learning_engine":
-            raise StorageError("Можно отменить только candidate, созданный Learning Engine")
+        if (
+            not row
+            or row["status"] != "candidate"
+            or row["source_type"] != "learning_engine"
+        ):
+            raise StorageError(
+                "Можно отменить только candidate, созданный Learning Engine"
+            )
         connection.execute(
             "UPDATE knowledge SET status='rejected',updated_at=? WHERE id=?",
             (now, knowledge_id),
@@ -1378,21 +1937,33 @@ def withdraw_learning_candidate(knowledge_id: int, *, reason: str) -> dict[str, 
             "INSERT INTO learning_event_audit "
             "(event_id,knowledge_id,action,status_from,status_to,occurred_at,details) "
             "VALUES(?,?,?,?,?,?,?)",
-            (event_id, knowledge_id, "candidate_withdrawn", "candidate", "rejected",
-             now, json.dumps({"reason": reason}, ensure_ascii=False)),
+            (
+                event_id,
+                knowledge_id,
+                "candidate_withdrawn",
+                "candidate",
+                "rejected",
+                now,
+                json.dumps({"reason": reason}, ensure_ascii=False),
+            ),
         )
-        return dict(connection.execute(
-            "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
-        ).fetchone())
+        return dict(
+            connection.execute(
+                "SELECT * FROM knowledge WHERE id=?", (knowledge_id,)
+            ).fetchone()
+        )
 
 
 def learning_status_summary() -> dict[str, Any]:
     """Считает состояние очереди анализа без изменения событий."""
     init_database()
     with _connect() as connection:
-        counts = {row["status"]: row["total"] for row in connection.execute(
-            "SELECT status, COUNT(*) AS total FROM task_events GROUP BY status"
-        )}
+        counts = {
+            row["status"]: row["total"]
+            for row in connection.execute(
+                "SELECT status, COUNT(*) AS total FROM task_events GROUP BY status"
+            )
+        }
         last_success = connection.execute(
             "SELECT MAX(analyzed_at) FROM task_events WHERE status IN "
             "('analysed','no_insight','candidate_created')"
@@ -1411,11 +1982,14 @@ def learning_status_summary() -> dict[str, Any]:
                 "failed": verification_counts["failed"] or 0,
                 "launch_failures": verification_counts["launch_failures"] or 0,
             },
-            "llm_provider": "ollama-local" if os.environ.get("AI_MEMORY_OLLAMA_MODEL") else "not configured",
+            "llm_provider": "ollama-local"
+            if os.environ.get("AI_MEMORY_OLLAMA_MODEL")
+            else "not configured",
             "automatic_analysis": False,
             "analyzed": counts.get("analysed", 0) + counts.get("no_insight", 0),
             "candidates_created": counts.get("candidate_created", 0),
-            "failures": counts.get("retryable_error", 0) + counts.get("permanent_error", 0),
+            "failures": counts.get("retryable_error", 0)
+            + counts.get("permanent_error", 0),
             "last_successful_analysis": last_success,
         }
 
@@ -1424,7 +1998,9 @@ def get_task_status(event_id: str) -> dict[str, Any] | None:
     """Возвращает сохранённое состояние обработки события."""
     init_database()
     with _connect() as connection:
-        row = connection.execute("SELECT * FROM task_events WHERE event_id=?", (event_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM task_events WHERE event_id=?", (event_id,)
+        ).fetchone()
         return dict(row) if row else None
 
 
@@ -1438,37 +2014,110 @@ def export_knowledge(knowledge_ids: list[int]) -> dict[str, Any]:
         rows = connection.execute(
             f"SELECT * FROM knowledge WHERE id IN ({placeholders})", knowledge_ids
         ).fetchall()
-    if len(rows) != len(set(knowledge_ids)) or any(r["status"] != "approved" or not r["publishable"] for r in rows):
-        raise StorageError("Экспорт разрешён только для выбранных approved-записей с publishable=true")
+    if len(rows) != len(set(knowledge_ids)) or any(
+        r["status"] != "approved" or not r["publishable"] for r in rows
+    ):
+        raise StorageError(
+            "Экспорт разрешён только для выбранных approved-записей с publishable=true"
+        )
     for row in rows:
-        if re.search(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*\S+", row["content"]):
-            raise StorageError("Возможный секрет обнаружен; запись не экспортирована")
-    return {"schema_version": 1, "knowledge": [{k: r[k] for k in ("uuid","category","title","content","technology","confidence","source_type","source_reference")} for r in rows]}
+        exported_text = " ".join(
+            str(row[field] or "")
+            for field in (
+                "category",
+                "title",
+                "content",
+                "technology",
+                "source_reference",
+            )
+        )
+        if _contains_sensitive_text(exported_text):
+            raise StorageError(
+                "Возможные чувствительные данные обнаружены; запись не экспортирована"
+            )
+    return {
+        "schema_version": 1,
+        "knowledge": [
+            {
+                k: r[k]
+                for k in (
+                    "uuid",
+                    "category",
+                    "title",
+                    "content",
+                    "technology",
+                    "confidence",
+                    "source_type",
+                    "source_reference",
+                )
+            }
+            for r in rows
+        ],
+    }
 
 
 def validate_import(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Проверяет версию и поля импортируемого JSON без записи в базу."""
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("knowledge"), list):
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or not isinstance(payload.get("knowledge"), list)
+    ):
         raise StorageError("Неподдерживаемый формат импорта")
-    cleaned = []
+    cleaned: list[dict[str, Any]] = []
     for item in payload["knowledge"]:
         if not isinstance(item, dict):
             raise StorageError("Запись импорта должна быть объектом")
-        cleaned.append({"category": _validate_text(item.get("category"),"category",100),
-                        "title": _validate_text(item.get("title"),"title",500),
-                        "content": _validate_text(item.get("content"),"content"),
-                        "technology": str(item.get("technology", ""))[:500],
-                        "source_reference": item.get("source_reference")})
+        category = item.get("category")
+        title = item.get("title")
+        content = item.get("content")
+        technology = item.get("technology", "")
+        source_reference = item.get("source_reference")
+        if not isinstance(category, str):
+            raise StorageError("category должен быть строкой")
+        if not isinstance(title, str):
+            raise StorageError("title должен быть строкой")
+        if not isinstance(content, str):
+            raise StorageError("content должен быть строкой")
+        if not isinstance(technology, str):
+            raise StorageError("technology должен быть строкой")
+        if source_reference is not None and not isinstance(source_reference, str):
+            raise StorageError("source_reference должен быть строкой или null")
+        if _contains_sensitive_text(
+            " ".join(
+                value
+                for value in (category, title, content, technology, source_reference)
+                if isinstance(value, str)
+            )
+        ):
+            raise StorageError("Импорт содержит чувствительные данные")
+        cleaned.append(
+            {
+                "category": _validate_text(category, "category", 100),
+                "title": _validate_text(title, "title", 500),
+                "content": _validate_text(content, "content"),
+                "technology": technology[:500],
+                "source_reference": source_reference,
+            }
+        )
     return cleaned
 
 
-def import_knowledge(payload: dict[str, Any], *, namespace: str = "global") -> list[int]:
+def import_knowledge(
+    payload: dict[str, Any], *, namespace: str = "global"
+) -> list[int]:
     """Импортирует проверенные записи как новые неподтверждённые кандидаты."""
     cleaned = validate_import(payload)
     ids = []
     for item in cleaned:
         try:
-            ids.append(int(create_knowledge(**item, source_type="import", namespace=namespace)["id"]))
+            ids.append(
+                int(
+                    create_knowledge(**item, source_type="import", namespace=namespace)[
+                        "id"
+                    ]
+                )
+            )
         except StorageError as exc:
             if "дубликат" not in str(exc):
                 raise
@@ -1486,7 +2135,10 @@ def backup_database(destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with _connect(read_only=True) as source, closing(sqlite3.connect(temporary)) as target:
+        with (
+            _connect(read_only=True) as source,
+            closing(sqlite3.connect(temporary)) as target,
+        ):
             source.backup(target)
         _validate_database_file(temporary)
         temporary.replace(destination)
@@ -1500,10 +2152,14 @@ def _validate_database_file(path: Path, *, require_current: bool = False) -> Non
     if not path.is_file():
         raise StorageError(f"Файл базы не найден: {path}")
     try:
-        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        with closing(
+            sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+        ) as connection:
             result = connection.execute("PRAGMA quick_check").fetchone()
             if result is None or result[0] != "ok":
-                raise StorageError(f"Проверка SQLite не пройдена: {result[0] if result else 'нет результата'}")
+                raise StorageError(
+                    f"Проверка SQLite не пройдена: {result[0] if result else 'нет результата'}"
+                )
             table = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge'"
             ).fetchone()
@@ -1515,6 +2171,112 @@ def _validate_database_file(path: Path, *, require_current: bool = False) -> Non
                     raise StorageError("В файле нет актуальной схемы базы")
     except sqlite3.DatabaseError as exc:
         raise StorageError(f"Некорректный файл базы: {exc}") from exc
+
+
+def verify_database_backup(source_path: Path) -> dict[str, Any]:
+    """Проверяет резервную копию без миграции или изменения её файла."""
+    source_path = source_path.expanduser().resolve()
+    _validate_database_file(source_path)
+    with closing(
+        sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)
+    ) as connection:
+        connection.row_factory = sqlite3.Row
+        schema_version = _database_schema_version(connection)
+        schema_current = migrations.MigrationEngine().is_current(connection)
+        knowledge_count = connection.execute(
+            "SELECT count(*) FROM knowledge"
+        ).fetchone()[0]
+    return {
+        "valid": True,
+        "source": str(source_path),
+        "schema_version": schema_version,
+        "schema_current": schema_current,
+        "knowledge_count": knowledge_count,
+    }
+
+
+def _database_schema_version(connection: sqlite3.Connection) -> int:
+    """Возвращает номер схемы либо ноль для базы до migration registry."""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    if table is None:
+        return 0
+    return int(
+        connection.execute(
+            "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+        ).fetchone()[0]
+    )
+
+
+def _knowledge_id_digest(connection: sqlite3.Connection) -> tuple[int, str]:
+    """Считает устойчивую контрольную сумму ID без чтения текстов знаний."""
+    digest = hashlib.sha256()
+    count = 0
+    for row in connection.execute("SELECT id FROM knowledge ORDER BY id"):
+        digest.update(int(row[0]).to_bytes(8, byteorder="big", signed=False))
+        count += 1
+    return count, digest.hexdigest()
+
+
+def dry_run_restore_database(
+    source_path: Path, *, temporary_directory: Path | None = None
+) -> dict[str, Any]:
+    """Проверяет копию и миграцию восстановления, не меняя активную БД."""
+    source_path = source_path.expanduser().resolve()
+    destination = current_database_path().resolve()
+    if source_path == destination:
+        raise StorageError("Источник восстановления совпадает с активной базой")
+    _validate_database_file(source_path)
+
+    temporary_root = (
+        temporary_directory.expanduser().resolve()
+        if temporary_directory is not None
+        else None
+    )
+    descriptor, staged_name = tempfile.mkstemp(
+        prefix="aem-restore-dry-run-",
+        suffix=".sqlite",
+        dir=temporary_root,
+    )
+    os.close(descriptor)
+    staged = Path(staged_name)
+    try:
+        with (
+            closing(
+                sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True)
+            ) as source,
+            closing(sqlite3.connect(staged)) as target,
+        ):
+            source_ids = _knowledge_id_digest(source)
+            source_version = _database_schema_version(source)
+            source.backup(target)
+        with closing(sqlite3.connect(staged)) as candidate:
+            candidate.row_factory = sqlite3.Row
+            migrations.MigrationEngine().apply(candidate)
+            candidate.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            candidate.execute("PRAGMA journal_mode=DELETE")
+            restored_ids = _knowledge_id_digest(candidate)
+            restored_version = _database_schema_version(candidate)
+        _validate_database_file(staged, require_current=True)
+        if source_ids != restored_ids:
+            raise StorageError("Проверка восстановления изменила integer ID знаний")
+        return {
+            "valid": True,
+            "dry_run": True,
+            "source": str(source_path),
+            "destination": str(destination),
+            "knowledge_count": restored_ids[0],
+            "knowledge_id_digest": restored_ids[1],
+            "source_schema_version": source_version,
+            "restored_schema_version": restored_version,
+            "ids_preserved": True,
+        }
+    finally:
+        staged.unlink(missing_ok=True)
+        Path(str(staged) + "-wal").unlink(missing_ok=True)
+        Path(str(staged) + "-shm").unlink(missing_ok=True)
+        Path(str(staged) + "-journal").unlink(missing_ok=True)
 
 
 def restore_database(source_path: Path) -> dict[str, str]:
@@ -1531,7 +2293,12 @@ def restore_database(source_path: Path) -> dict[str, str]:
     )
     replaced = False
     try:
-        with closing(sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)) as source, closing(sqlite3.connect(staged)) as target:
+        with (
+            closing(
+                sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)
+            ) as source,
+            closing(sqlite3.connect(staged)) as target,
+        ):
             source.backup(target)
         with closing(sqlite3.connect(staged)) as candidate:
             candidate.row_factory = sqlite3.Row
@@ -1547,7 +2314,11 @@ def restore_database(source_path: Path) -> dict[str, str]:
         staged.replace(destination)
         replaced = True
         _validate_database_file(destination, require_current=True)
-        return {"database": str(destination), "source": str(source_path), "pre_restore_backup": str(previous) if previous.exists() else ""}
+        return {
+            "database": str(destination),
+            "source": str(source_path),
+            "pre_restore_backup": str(previous) if previous.exists() else "",
+        }
     except Exception:
         if replaced:
             if previous.exists():
@@ -1586,7 +2357,7 @@ def _skill_file_path(name: str) -> Path:
 def list_skills() -> list[dict[str, Any]]:
     """Находит Skills с валидным front matter внутри разрешённого каталога."""
     skills_dir = _skills_root()
-    result = []
+    result: list[dict[str, Any]] = []
     if not skills_dir.exists():
         return result
     for path in sorted(skills_dir.glob("*/SKILL.md")):
@@ -1597,7 +2368,9 @@ def list_skills() -> list[dict[str, Any]]:
         metadata = _skill_frontmatter(text)
         if _contains_sensitive_text(text):
             raise StorageError("Активный Skill содержит возможные приватные данные")
-        result.append({**metadata, "path": f"skills/{path.parent.name}", "status": "active"})
+        result.append(
+            {**metadata, "path": f"skills/{path.parent.name}", "status": "active"}
+        )
     return result
 
 
@@ -1605,7 +2378,7 @@ def _skill_frontmatter(text: str) -> dict[str, str]:
     """Извлекает обязательные поля YAML front matter без небезопасного загрузчика."""
     if not text.startswith("---\n") or "\n---" not in text[4:]:
         raise StorageError("SKILL.md должен начинаться с YAML front matter")
-    header = text[4:text.index("\n---", 4)]
+    header = text[4 : text.index("\n---", 4)]
     fields: dict[str, str] = {}
     in_metadata = False
     for line in header.splitlines():
@@ -1643,14 +2416,20 @@ def validate_skill(content: str) -> dict[str, Any]:
     return {"valid": True, "metadata": metadata}
 
 
-def propose_skill_update(skill_name: str, proposer: str, description: str, content: str) -> str:
+def propose_skill_update(
+    skill_name: str, proposer: str, description: str, content: str
+) -> str:
     """Проверяет метаданные и текст перед сохранением кандидата Skill."""
     if not re.fullmatch(r"[a-z0-9-]{1,64}", skill_name):
         raise StorageError("Недопустимое имя Skill")
     safe_proposer = _validate_text(proposer, "proposer", 100)
     safe_description = _validate_text(description, "description", 1_000)
-    if _contains_sensitive_text(safe_proposer) or _contains_sensitive_text(safe_description):
-        raise StorageError("Метаданные предложения Skill содержат возможные приватные данные")
+    if _contains_sensitive_text(safe_proposer) or _contains_sensitive_text(
+        safe_description
+    ):
+        raise StorageError(
+            "Метаданные предложения Skill содержат возможные приватные данные"
+        )
     _validate_text(content, "content", MAX_TEXT_LENGTH)
     if _contains_sensitive_text(content):
         raise StorageError("Предложение Skill содержит возможные приватные данные")
@@ -1660,8 +2439,17 @@ def propose_skill_update(skill_name: str, proposer: str, description: str, conte
     init_database()
     proposal_id = str(uuid.uuid4())
     with _connect() as connection:
-        connection.execute("INSERT INTO skill_proposals(id,skill_name,proposer,change_description,proposed_content,created_at) VALUES(?,?,?,?,?,?)",
-                           (proposal_id, skill_name, safe_proposer, safe_description, content, datetime.now(UTC).isoformat()))
+        connection.execute(
+            "INSERT INTO skill_proposals(id,skill_name,proposer,change_description,proposed_content,created_at) VALUES(?,?,?,?,?,?)",
+            (
+                proposal_id,
+                skill_name,
+                safe_proposer,
+                safe_description,
+                content,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
     return proposal_id
 
 
@@ -1669,11 +2457,14 @@ def list_skill_proposals(status: str = "candidate") -> list[dict[str, Any]]:
     """Выводит предложения Skills, скрывая их полный текст по умолчанию."""
     init_database()
     with _connect() as connection:
-        proposals = [dict(r) for r in connection.execute(
-            "SELECT id,skill_name,proposer,change_description,status,created_at "
-            "FROM skill_proposals WHERE status=? ORDER BY created_at DESC",
-            (status,),
-        )]
+        proposals = [
+            dict(r)
+            for r in connection.execute(
+                "SELECT id,skill_name,proposer,change_description,status,created_at "
+                "FROM skill_proposals WHERE status=? ORDER BY created_at DESC",
+                (status,),
+            )
+        ]
     for proposal in proposals:
         for field in ("proposer", "change_description"):
             if _contains_sensitive_text(proposal[field]):
@@ -1709,12 +2500,16 @@ def get_skill_proposal(proposal_id: str) -> dict[str, Any]:
     result["current_content"] = (
         current_path.read_text(encoding="utf-8") if current_path.is_file() else None
     )
-    if result["current_content"] and _contains_sensitive_text(result["current_content"]):
+    if result["current_content"] and _contains_sensitive_text(
+        result["current_content"]
+    ):
         raise StorageError("Активный Skill содержит возможные приватные данные")
     return result
 
 
-def decide_skill_proposal(proposal_id: str, *, decision: str, maintainer: str, reason: str = "") -> dict[str, Any]:
+def decide_skill_proposal(
+    proposal_id: str, *, decision: str, maintainer: str, reason: str = ""
+) -> dict[str, Any]:
     """Принимает или отклоняет предложение, проверяя локальное имя maintainer."""
     if decision not in {"approved", "rejected"}:
         raise StorageError("Недопустимое решение")
@@ -1723,15 +2518,23 @@ def decide_skill_proposal(proposal_id: str, *, decision: str, maintainer: str, r
         reason = _validate_decision_reason(reason)
     init_database()
     with _connect() as connection:
-        row = connection.execute("SELECT * FROM skill_proposals WHERE id=?", (proposal_id,)).fetchone()
+        row = connection.execute(
+            "SELECT * FROM skill_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
         if not row or row["status"] != "candidate":
             raise StorageError("Предложение не найдено или уже обработано")
         now = datetime.now(UTC).isoformat()
         current_path = _skill_file_path(row["skill_name"])
-        original = current_path.read_text(encoding="utf-8") if current_path.is_file() else None
+        original = (
+            current_path.read_text(encoding="utf-8") if current_path.is_file() else None
+        )
         if decision == "approved" and any(
             _contains_sensitive_text(value)
-            for value in (row["proposer"], row["change_description"], row["proposed_content"])
+            for value in (
+                row["proposer"],
+                row["change_description"],
+                row["proposed_content"],
+            )
         ):
             raise StorageError("Предложение Skill содержит возможные приватные данные")
         version = "0.1.0"
@@ -1747,30 +2550,63 @@ def decide_skill_proposal(proposal_id: str, *, decision: str, maintainer: str, r
                 current = _skill_frontmatter(original)
                 previous = current.get("version")
                 if not previous or not re.fullmatch(r"\d+\.\d+\.\d+", previous):
-                    raise StorageError("Текущий Skill должен иметь SemVer в metadata.version")
-                if tuple(map(int, version.split("."))) <= tuple(map(int, previous.split("."))):
+                    raise StorageError(
+                        "Текущий Skill должен иметь SemVer в metadata.version"
+                    )
+                if tuple(map(int, version.split("."))) <= tuple(
+                    map(int, previous.split("."))
+                ):
                     raise StorageError("Новая версия должна быть выше текущей")
         try:
             if decision == "approved":
                 current_path.parent.mkdir(parents=True, exist_ok=True)
-                descriptor, temporary_name = tempfile.mkstemp(prefix=".SKILL-", suffix=".tmp", dir=current_path.parent)
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix=".SKILL-", suffix=".tmp", dir=current_path.parent
+                )
                 try:
-                    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                    with os.fdopen(
+                        descriptor, "w", encoding="utf-8", newline="\n"
+                    ) as stream:
                         stream.write(row["proposed_content"])
                         stream.flush()
                         os.fsync(stream.fileno())
                     Path(temporary_name).replace(current_path)
                 finally:
                     Path(temporary_name).unlink(missing_ok=True)
-            connection.execute("UPDATE skill_proposals SET status=?,decided_at=?,decision_by=?,decision_reason=? WHERE id=?",
-                               (decision,now,maintainer,reason,proposal_id))
+            connection.execute(
+                "UPDATE skill_proposals SET status=?,decided_at=?,decision_by=?,decision_reason=? WHERE id=?",
+                (decision, now, maintainer, reason, proposal_id),
+            )
             if decision == "approved":
                 if original is not None and previous is not None:
-                    connection.execute("INSERT OR IGNORE INTO skill_versions(skill_name,version,content,changelog,validation_result,created_at) VALUES(?,?,?,?,?,?)",
-                                       (row["skill_name"],previous,original,"Исходная утверждённая версия","validated",now))
-                connection.execute("INSERT INTO skill_versions(skill_name,version,content,changelog,previous_version,proposal_id,validation_result,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                                   (row["skill_name"],version,row["proposed_content"],row["change_description"],previous,proposal_id,"validated",now))
-            result = connection.execute("SELECT id,skill_name,status,decided_at,decision_by,decision_reason FROM skill_proposals WHERE id=?",(proposal_id,)).fetchone()
+                    connection.execute(
+                        "INSERT OR IGNORE INTO skill_versions(skill_name,version,content,changelog,validation_result,created_at) VALUES(?,?,?,?,?,?)",
+                        (
+                            row["skill_name"],
+                            previous,
+                            original,
+                            "Исходная утверждённая версия",
+                            "validated",
+                            now,
+                        ),
+                    )
+                connection.execute(
+                    "INSERT INTO skill_versions(skill_name,version,content,changelog,previous_version,proposal_id,validation_result,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        row["skill_name"],
+                        version,
+                        row["proposed_content"],
+                        row["change_description"],
+                        previous,
+                        proposal_id,
+                        "validated",
+                        now,
+                    ),
+                )
+            result = connection.execute(
+                "SELECT id,skill_name,status,decided_at,decision_by,decision_reason FROM skill_proposals WHERE id=?",
+                (proposal_id,),
+            ).fetchone()
             return dict(result)
         except Exception:
             if decision == "approved":
@@ -1787,24 +2623,32 @@ def get_skill_history(skill_name: str) -> list[dict[str, Any]]:
         raise StorageError("Недопустимое имя Skill")
     init_database()
     with _connect() as connection:
-        versions = [dict(row) for row in connection.execute(
-            "SELECT id,skill_name,version,changelog,previous_version,proposal_id,validation_result,created_at FROM skill_versions WHERE skill_name=? ORDER BY id DESC",
-            (skill_name,),
-        )]
+        versions = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT id,skill_name,version,changelog,previous_version,proposal_id,validation_result,created_at FROM skill_versions WHERE skill_name=? ORDER BY id DESC",
+                (skill_name,),
+            )
+        ]
     for version in versions:
         if _contains_sensitive_text(version["changelog"]):
             version["changelog"] = "[redacted]"
     return versions
 
 
-def rollback_skill_version(skill_name: str, version: str, *, maintainer: str) -> dict[str, Any]:
+def rollback_skill_version(
+    skill_name: str, version: str, *, maintainer: str
+) -> dict[str, Any]:
     """Атомарно восстанавливает содержимое выбранной версии без удаления истории."""
     maintainer = require_maintainer(maintainer)
     init_database()
     path = _skill_file_path(skill_name)
     now = datetime.now(UTC).isoformat()
     with _connect() as connection:
-        target = connection.execute("SELECT * FROM skill_versions WHERE skill_name=? AND version=?",(skill_name,version)).fetchone()
+        target = connection.execute(
+            "SELECT * FROM skill_versions WHERE skill_name=? AND version=?",
+            (skill_name, version),
+        ).fetchone()
         if not target:
             raise StorageError("Версия Skill не найдена")
         original = path.read_text(encoding="utf-8") if path.is_file() else None
@@ -1815,13 +2659,27 @@ def rollback_skill_version(skill_name: str, version: str, *, maintainer: str) ->
         metadata = validate_skill(target["content"])["metadata"]
         if metadata["name"] != skill_name or metadata.get("version") != version:
             raise StorageError("Метаданные версии Skill не совпадают с записью истории")
-        current_version = _skill_frontmatter(original).get("version") if original else None
+        current_version = (
+            _skill_frontmatter(original).get("version") if original else None
+        )
         if current_version:
-            connection.execute("INSERT OR IGNORE INTO skill_versions(skill_name,version,content,changelog,previous_version,validation_result,created_at) VALUES(?,?,?,?,?,?,?)",
-                               (skill_name,current_version,original,"Сохранение перед откатом",version,"validated",now))
-        descriptor, temporary_name = tempfile.mkstemp(prefix=".SKILL-",suffix=".tmp",dir=path.parent)
+            connection.execute(
+                "INSERT OR IGNORE INTO skill_versions(skill_name,version,content,changelog,previous_version,validation_result,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    skill_name,
+                    current_version,
+                    original,
+                    "Сохранение перед откатом",
+                    version,
+                    "validated",
+                    now,
+                ),
+            )
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".SKILL-", suffix=".tmp", dir=path.parent
+        )
         try:
-            with os.fdopen(descriptor,"w",encoding="utf-8",newline="\n") as stream:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
                 stream.write(target["content"])
                 stream.flush()
                 os.fsync(stream.fileno())
@@ -1829,4 +2687,4 @@ def rollback_skill_version(skill_name: str, version: str, *, maintainer: str) ->
         except Exception:
             Path(temporary_name).unlink(missing_ok=True)
             raise
-        return {"skill_name":skill_name,"version":version,"restored_at":now}
+        return {"skill_name": skill_name, "version": version, "restored_at": now}

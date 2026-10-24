@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
+import json
 import sqlite3
 
 import pytest
@@ -13,10 +15,14 @@ from ai_engineering_memory.settings import Settings
 
 def _add(store, title: str) -> int:
     with store.activate():
-        return int(store.create_knowledge(
-            category="backend", title=title, content=f"Content for {title}",
-            namespace="project:restore-test",
-        )["id"])
+        return int(
+            store.create_knowledge(
+                category="backend",
+                title=title,
+                content=f"Content for {title}",
+                namespace="project:restore-test",
+            )["id"]
+        )
 
 
 def _titles(store) -> set[str]:
@@ -42,9 +48,12 @@ def test_backup_and_restore_round_trip_keeps_pre_restore_snapshot(tmp_path):
     assert pre_restore
     with sqlite3.connect(pre_restore) as connection:
         assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
-        assert connection.execute(
-            "SELECT title FROM knowledge WHERE title='Before restore'"
-        ).fetchone() is not None
+        assert (
+            connection.execute(
+                "SELECT title FROM knowledge WHERE title='Before restore'"
+            ).fetchone()
+            is not None
+        )
 
 
 def test_restore_rejects_invalid_source_without_changing_active_database(tmp_path):
@@ -71,7 +80,43 @@ def test_backup_does_not_create_or_initialize_a_missing_active_database(tmp_path
     assert not database_path.exists()
 
 
-def test_restore_cli_requires_exact_interactive_confirmation(tmp_path, monkeypatch, capsys):
+def test_backup_verify_and_restore_dry_run_are_read_only_cli_operations(
+    tmp_path, monkeypatch, capsys
+):
+    """Verify и dry-run проверяют schema/ID, не меняя ни backup, ни активную БД."""
+    active = tmp_path / "active.sqlite"
+    backup = tmp_path / "backup.sqlite"
+    store = storage.create_storage(Settings(active))
+    monkeypatch.setenv("AI_MEMORY_DB", str(active))
+    _add(store, "From backup")
+    with store.activate():
+        storage.backup_database(backup)
+    _add(store, "Keep current state")
+
+    def digest(path):
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+
+    active_before = digest(active)
+    backup_before = digest(backup)
+
+    assert cli.main(["backup", "verify", str(backup)]) == 0
+    verify_output = capsys.readouterr().out
+    assert "schema_current=True" in verify_output
+
+    assert cli.main(["--format", "json", "restore", str(backup), "--dry-run"]) == 0
+    dry_run = json.loads(capsys.readouterr().out)
+    assert dry_run["valid"] is True
+    assert dry_run["ids_preserved"] is True
+    assert dry_run["knowledge_count"] == 1
+    assert digest(active) == active_before
+    assert digest(backup) == backup_before
+    assert _titles(store) == {"From backup", "Keep current state"}
+
+
+def test_restore_cli_requires_exact_interactive_confirmation(
+    tmp_path, monkeypatch, capsys
+):
     """CLI отклоняет non-interactive и неверное подтверждение до записи."""
     active = tmp_path / "active.sqlite"
     monkeypatch.setenv("AI_MEMORY_DB", str(active))

@@ -34,7 +34,9 @@ def isolated_db(tmp_path, monkeypatch):
 
 
 def test_review_scopes_candidates_and_requires_exact_decisions(
-    isolated_db, monkeypatch, capsys,
+    isolated_db,
+    monkeypatch,
+    capsys,
 ):
     """Обзор видит только global и текущий проект и журналирует решения."""
     project = isolated_db / "current"
@@ -43,26 +45,40 @@ def test_review_scopes_candidates_and_requires_exact_decisions(
     foreign_project.mkdir()
     for repository in (project, foreign_project):
         subprocess.run(
-            ["git", "init", "--quiet"], cwd=repository, check=True,
-            stdin=subprocess.DEVNULL, capture_output=True,
+            ["git", "init", "--quiet"],
+            cwd=repository,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
         )
     global_candidate = storage.create_knowledge(
-        "backend", "Global candidate", "A shared operational finding.",
+        "backend",
+        "Global candidate",
+        "A shared operational finding.",
         namespace="global",
         evidence={"kind": "test", "result": "verified", "source": "verification:abc"},
     )
     local_candidate = storage.create_knowledge(
-        "backend", "Project candidate", "A project-scoped finding.",
+        "backend",
+        "Project candidate",
+        "A project-scoped finding.",
         namespace=learning.project_namespace(project),
     )
     foreign_candidate = storage.create_knowledge(
-        "backend", "Foreign candidate", "Must remain isolated.",
+        "backend",
+        "Foreign candidate",
+        "Must remain isolated.",
         namespace=learning.project_namespace(foreign_project),
     )
-    answers = iter([
-        "a", f"APPROVE {global_candidate['id']}",
-        "r", f"REJECT {local_candidate['id']}", "Not reproducible in this project",
-    ])
+    answers = iter(
+        [
+            "a",
+            f"APPROVE {global_candidate['id']}",
+            "r",
+            f"REJECT {local_candidate['id']}",
+            "Not reproducible in this project",
+        ]
+    )
     monkeypatch.setattr(cli.sys, "stdin", _Terminal(interactive=True))
     monkeypatch.setattr(builtins, "input", lambda _prompt: next(answers))
 
@@ -86,15 +102,23 @@ def test_review_scopes_candidates_and_requires_exact_decisions(
         f"knowledge:{global_candidate['id']}",
         f"knowledge:{local_candidate['id']}",
     ]
-    assert json.loads(decisions[1]["details"])["reason"] == "Not reproducible in this project"
+    assert (
+        json.loads(decisions[1]["details"])["reason"]
+        == "Not reproducible in this project"
+    )
 
 
 def test_review_refuses_noninteractive_input_without_changing_candidates(
-    isolated_db, monkeypatch, capsys,
+    isolated_db,
+    monkeypatch,
+    capsys,
 ):
     """Пайп или фоновый запуск не могут утвердить candidate без человека."""
     candidate = storage.create_knowledge(
-        "ops", "Candidate", "Await a maintainer decision.", namespace="global",
+        "ops",
+        "Candidate",
+        "Await a maintainer decision.",
+        namespace="global",
     )
     monkeypatch.setattr(cli.sys, "stdin", _Terminal(interactive=False))
 
@@ -105,12 +129,18 @@ def test_review_refuses_noninteractive_input_without_changing_candidates(
 
 
 def test_review_labels_learning_confidence_as_codex_estimate(
-    isolated_db, monkeypatch, capsys,
+    isolated_db,
+    monkeypatch,
+    capsys,
 ):
     """Кандидат обучения не выдаёт самооценку модели за серверную уверенность."""
     storage.create_knowledge(
-        "backend", "A repeated finding", "A candidate from cross-project learning.",
-        namespace="global", source_type="cross_project_learning", confidence=0.8,
+        "backend",
+        "A repeated finding",
+        "A candidate from cross-project learning.",
+        namespace="global",
+        source_type="cross_project_learning",
+        confidence=0.8,
     )
     monkeypatch.setattr(cli.sys, "stdin", _Terminal(interactive=True))
     monkeypatch.setattr(builtins, "input", lambda _prompt: "s")
@@ -123,16 +153,21 @@ def test_review_labels_learning_confidence_as_codex_estimate(
 
 
 def test_review_escapes_terminal_controls_in_untrusted_candidate_text(
-    isolated_db, monkeypatch, capsys,
+    isolated_db,
+    monkeypatch,
+    capsys,
 ):
     """ANSI и возврат каретки в кандидате не подменяют вывод подтверждения."""
     storage.create_knowledge(
-        "backend", "Candidate\x1b[2J",
+        "backend",
+        "Candidate\x1b[2J",
         "Text\rInjected title\x07\nРешение [a] утвердить, [r] отклонить",
         namespace="global",
         evidence={
-            "kind": "check\x1b[31m", "result": "evidence\x1b[2K",
-            "source": "verification:abc\rspoofed", "limitations": "none\x07",
+            "kind": "check\x1b[31m",
+            "result": "evidence\x1b[2K",
+            "source": "verification:abc\rspoofed",
+            "limitations": "none\x07",
         },
     )
     monkeypatch.setattr(cli.sys, "stdin", _Terminal(interactive=True))

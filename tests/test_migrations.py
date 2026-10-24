@@ -32,7 +32,8 @@ def _write_legacy_fixture(path, version: int) -> None:
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
         )
         connection.execute(
-            "INSERT INTO schema_migrations VALUES(?, 'legacy-fixture')", (version,),
+            "INSERT INTO schema_migrations VALUES(?, 'legacy-fixture')",
+            (version,),
         )
 
         if version >= 2:
@@ -49,14 +50,24 @@ def _write_legacy_fixture(path, version: int) -> None:
             connection.execute(
                 "INSERT INTO task_events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    "legacy-event", "project:migration", "legacy-task", "Codex",
-                    "Existing event", "[]", "{}", "finished",
-                    "2026-10-01T00:00:00Z", "pending_analysis", None,
+                    "legacy-event",
+                    "project:migration",
+                    "legacy-task",
+                    "Codex",
+                    "Existing event",
+                    "[]",
+                    "{}",
+                    "finished",
+                    "2026-10-01T00:00:00Z",
+                    "pending_analysis",
+                    None,
                 ),
             )
 
         if version >= 3:
-            connection.execute("ALTER TABLE task_events ADD COLUMN verification_id TEXT")
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN verification_id TEXT"
+            )
             connection.execute(
                 """CREATE TABLE verification_records (
                     verification_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
@@ -69,7 +80,9 @@ def _write_legacy_fixture(path, version: int) -> None:
             )
 
         if version >= 4:
-            connection.execute("ALTER TABLE task_events ADD COLUMN project_fingerprint TEXT")
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN project_fingerprint TEXT"
+            )
             connection.execute(
                 "ALTER TABLE verification_records ADD COLUMN project_fingerprint TEXT"
             )
@@ -112,9 +125,12 @@ def test_legacy_schema_migration_retains_ids_and_is_repeatable(tmp_path, version
         assert event["status"] == "waiting_for_verification"
         assert first_audit_count == 1
         with store.activate(), storage._connect() as connection:
-            assert connection.execute(
-                "SELECT COUNT(*) FROM learning_event_audit"
-            ).fetchone()[0] == first_audit_count
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM learning_event_audit"
+                ).fetchone()[0]
+                == first_audit_count
+            )
 
 
 def test_failed_migration_step_rolls_back_schema_and_data(tmp_path):

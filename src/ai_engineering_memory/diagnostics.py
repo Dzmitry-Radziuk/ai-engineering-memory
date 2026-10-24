@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -77,24 +78,31 @@ def _database_check(path: Path) -> dict[str, Any]:
         "path": str(path),
         "integrity": None,
         "schema_version": None,
+        "database_size_bytes": None,
+        "wal_size_bytes": None,
+        "fts_available": None,
     }
     if not path.is_file():
         return result
 
     wal_path = Path(f"{path}-wal")
     try:
+        result["database_size_bytes"] = path.stat().st_size
         wal_stat = wal_path.stat() if wal_path.exists() else None
         wal_before = (wal_stat.st_size, wal_stat.st_mtime_ns) if wal_stat else None
+        result["wal_size_bytes"] = wal_before[0] if wal_before else 0
     except OSError as exc:
         result["status"] = "error"
         result["error_type"] = type(exc).__name__
         return result
     if wal_before and wal_before[0] > 0:
-        result.update({
-            "status": "warning",
-            "integrity": "skipped_active_wal",
-            "recommendation": "SQLite WAL is active; integrity check was skipped to keep this command read-only.",
-        })
+        result.update(
+            {
+                "status": "warning",
+                "integrity": "skipped_active_wal",
+                "recommendation": "SQLite WAL is active; integrity check was skipped to keep this command read-only.",
+            }
+        )
         return result
 
     try:
@@ -113,15 +121,16 @@ def _database_check(path: Path) -> dict[str, Any]:
                 result["schema_version"] = version
 
             tables = {
-                str(row[0]) for row in connection.execute(
+                str(row[0])
+                for row in connection.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
+            result["fts_available"] = "knowledge_fts" in tables
             if "knowledge" in tables:
                 columns = {
-                    str(row[1]) for row in connection.execute(
-                        "PRAGMA table_info(knowledge)"
-                    )
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(knowledge)")
                 }
                 if "status" in columns:
                     counts = connection.execute(
@@ -136,18 +145,19 @@ def _database_check(path: Path) -> dict[str, Any]:
 
             learning_counts: dict[str, Any] = {}
             for table in (
-                "task_events", "verification_records", "learning_corroborations",
+                "task_events",
+                "verification_records",
+                "learning_corroborations",
             ):
                 if table not in tables:
                     continue
                 columns = {
-                    str(row[1]) for row in connection.execute(
-                        f"PRAGMA table_info({table})"
-                    )
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})")
                 }
-                total = int(connection.execute(
-                    f"SELECT COUNT(*) FROM {table}"
-                ).fetchone()[0])
+                total = int(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                )
                 entry: dict[str, Any] = {"total": total}
                 if "status" in columns:
                     counts = connection.execute(
@@ -164,18 +174,22 @@ def _database_check(path: Path) -> dict[str, Any]:
         wal_stat = wal_path.stat() if wal_path.exists() else None
         wal_after = (wal_stat.st_size, wal_stat.st_mtime_ns) if wal_stat else None
         if wal_before != wal_after:
-            result.update({
-                "status": "warning",
-                "integrity": "snapshot_changed",
-                "recommendation": "SQLite files changed during diagnosis; rerun when no writer is active.",
-            })
+            result.update(
+                {
+                    "status": "warning",
+                    "integrity": "snapshot_changed",
+                    "recommendation": "SQLite files changed during diagnosis; rerun when no writer is active.",
+                }
+            )
             return result
 
         if integrity != "ok":
             result["status"] = "error"
         elif result["schema_version"] != LATEST_SCHEMA_VERSION:
             result["status"] = "warning"
-            result["recommendation"] = "Run `ai-memory init` to apply additive migrations."
+            result["recommendation"] = (
+                "Run `ai-memory init` to apply additive migrations."
+            )
         else:
             result["status"] = "ok"
     except (OSError, sqlite3.Error, ValueError) as exc:
@@ -210,7 +224,7 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
     hooks = document.get("hooks") if isinstance(document, dict) else None
     for event in _HOOK_EVENTS:
         definitions = hooks.get(event, []) if isinstance(hooks, dict) else []
-        handlers = []
+        handlers: list[dict[str, Any]] = []
         if isinstance(definitions, list):
             for definition in definitions:
                 definition_handlers = (
@@ -218,7 +232,8 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
                 )
                 if isinstance(definition_handlers, list):
                     handlers.extend(
-                        handler for handler in definition_handlers
+                        handler
+                        for handler in definition_handlers
                         if isinstance(handler, dict)
                         and handler.get("type") == "command"
                         and isinstance(handler.get("command"), str)
@@ -230,20 +245,24 @@ def _hook_config_check(path: Path) -> dict[str, Any]:
         matching_commands = [handler["command"] for handler in matching_handlers]
         result["registration_counts"][event] = len(matching_commands)
         result["events"][event] = (
-            "missing" if not matching_commands
-            else "duplicate" if len(matching_commands) > 1
+            "missing"
+            if not matching_commands
+            else "duplicate"
+            if len(matching_commands) > 1
             else "ok"
         )
         result["launchers"][event] = (
             any(_command_launcher_exists(command) for command in matching_commands)
-            if matching_commands else False
+            if matching_commands
+            else False
         )
         result["launcher_matches_current_interpreter"][event] = (
             any(
                 _command_matches_current_interpreter(command)
                 for command in matching_commands
             )
-            if matching_commands else False
+            if matching_commands
+            else False
         )
         timeout_matches = bool(matching_handlers) and all(
             type(handler.get("timeout")) is int
@@ -286,6 +305,8 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
         "stale_source_events": [],
         "error_count": 0,
         "invalid_line_count": 0,
+        "duration_summary_ms": None,
+        "search_duration_summary_ms": None,
     }
     if not path.is_file():
         return result
@@ -317,6 +338,8 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
             continue
         records.append(record)
 
+    hook_durations: list[int] = []
+    search_durations: list[int] = []
     for record in records:
         event = record["event"]
         timestamp = record.get("timestamp")
@@ -328,8 +351,24 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
         else:
             timestamp = None
         duration_ms = record.get("duration_ms")
-        if not isinstance(duration_ms, int) or not 0 <= duration_ms <= 86_400_000:
+        if (
+            not isinstance(duration_ms, int)
+            or isinstance(duration_ms, bool)
+            or not 0 <= duration_ms <= 86_400_000
+        ):
             duration_ms = None
+        else:
+            hook_durations.append(duration_ms)
+        search_duration_ms = record.get("search_duration_ms")
+        if (
+            isinstance(search_duration_ms, int)
+            and not isinstance(search_duration_ms, bool)
+            and 0 <= search_duration_ms <= 86_400_000
+            and event == "UserPromptSubmit"
+        ):
+            search_durations.append(search_duration_ms)
+        else:
+            search_duration_ms = None
         source = record.get("source")
         safe_source = (
             source
@@ -339,11 +378,20 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
         result["events"][event] = {
             "timestamp": timestamp,
             "source": safe_source,
-            "result": record.get("result") if record.get("result") in {
-                "success", "captured", "verification_required", "no_verified_marker", "error",
-                "marker_present_unverified", "no_marker_seen",
-            } else None,
+            "result": record.get("result")
+            if record.get("result")
+            in {
+                "success",
+                "captured",
+                "verification_required",
+                "no_verified_marker",
+                "error",
+                "marker_present_unverified",
+                "no_marker_seen",
+            }
+            else None,
             "duration_ms": duration_ms,
+            "search_duration_ms": search_duration_ms,
             "learning_instruction_injected": (
                 record.get("learning_instruction_injected")
                 if isinstance(record.get("learning_instruction_injected"), bool)
@@ -359,16 +407,33 @@ def _hook_log_check(path: Path) -> dict[str, Any]:
         if record.get("result") == "error":
             result["error_count"] += 1
 
+    def summarize_durations(values: list[int]) -> dict[str, int | float] | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        return {
+            "count": len(ordered),
+            "min_ms": ordered[0],
+            "mean_ms": round(sum(ordered) / len(ordered), 2),
+            "p95_ms": ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)],
+            "max_ms": ordered[-1],
+        }
+
+    result["duration_summary_ms"] = summarize_durations(hook_durations)
+    result["search_duration_summary_ms"] = summarize_durations(search_durations)
+
     result["missing_events"] = [
         event for event in _HOOK_EVENTS if event not in result["events"]
     ]
     latest_error_events = [
-        event for event, details in result["events"].items()
+        event
+        for event, details in result["events"].items()
         if details["result"] == "error"
     ]
     result["latest_error_events"] = latest_error_events
     result["stale_source_events"] = [
-        event for event, details in result["events"].items()
+        event
+        for event, details in result["events"].items()
         if details["source"] is not None and details["source"] != HOOK_SOURCE
     ]
     has_unrecognized_result = any(
@@ -467,8 +532,6 @@ def _maintainer_check(
     }
 
 
-
-
 def _same_project_namespace(first: Path, second: Path) -> bool | None:
     """Сравнивает пути по тем же Git-границам, что и MCP namespace."""
     try:
@@ -498,7 +561,8 @@ def _memory_mcp_check(
     if mcp_config_path is None and project_mcp_config_path is None:
         return result
     config, error_type, config_scope = _effective_mcp_config(
-        mcp_config_path, project_mcp_config_path,
+        mcp_config_path,
+        project_mcp_config_path,
     )
     result["config_scope"] = config_scope
     if error_type:
@@ -546,14 +610,19 @@ def _memory_mcp_check(
                 try:
                     project_cwd = project_cwd.resolve(strict=True)
                 except (OSError, RuntimeError, ValueError):
-                    result.update({"status": "invalid_project_cwd", "project_scope": "invalid"})
+                    result.update(
+                        {"status": "invalid_project_cwd", "project_scope": "invalid"}
+                    )
                     return result
                 if not project_cwd.is_dir():
-                    result.update({"status": "invalid_project_cwd", "project_scope": "invalid"})
+                    result.update(
+                        {"status": "invalid_project_cwd", "project_scope": "invalid"}
+                    )
                     return result
                 if expected_project_root is not None:
                     matches_expected = _same_project_namespace(
-                        project_cwd, expected_project_root,
+                        project_cwd,
+                        expected_project_root,
                     )
                     if matches_expected is None:
                         result["project_scope_match"] = "unverified"
@@ -567,20 +636,27 @@ def _memory_mcp_check(
     else:
         project_root = Path(configured_root.strip()).expanduser()
         if not project_root.is_absolute():
-            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            result.update(
+                {"status": "invalid_project_root", "project_scope": "invalid"}
+            )
             return result
         try:
             project_root = project_root.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
-            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            result.update(
+                {"status": "invalid_project_root", "project_scope": "invalid"}
+            )
             return result
         if not project_root.is_dir():
-            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            result.update(
+                {"status": "invalid_project_root", "project_scope": "invalid"}
+            )
             return result
         result["project_scope"] = "configured_root"
         if expected_project_root is not None:
             matches_expected = _same_project_namespace(
-                project_root, expected_project_root,
+                project_root,
+                expected_project_root,
             )
             if matches_expected is None:
                 result["project_scope_match"] = "expected_root_unavailable"
@@ -592,7 +668,8 @@ def _memory_mcp_check(
     command = server.get("command")
     args = server.get("args", [])
     if (
-        not isinstance(command, str) or not command.strip()
+        not isinstance(command, str)
+        or not command.strip()
         or not isinstance(args, list)
         or any(not isinstance(argument, str) for argument in args)
     ):
@@ -612,14 +689,14 @@ def _memory_mcp_check(
 
     normalized_args = [argument.casefold() for argument in args]
     module_entrypoint = any(
-        normalized_args[index:index + 4]
+        normalized_args[index : index + 4]
         == ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
         for index in range(max(0, len(normalized_args) - 3))
     )
-    executable_entrypoint = (
-        executable.stem.casefold() in {"ai-memory", "ai-memory.exe"}
-        and normalized_args[:2] == ["mcp", "serve"]
-    )
+    executable_entrypoint = executable.stem.casefold() in {
+        "ai-memory",
+        "ai-memory.exe",
+    } and normalized_args[:2] == ["mcp", "serve"]
     result["entrypoint_valid"] = module_entrypoint or executable_entrypoint
     if not result["entrypoint_valid"]:
         result["status"] = "incomplete"
@@ -649,7 +726,8 @@ def _probe_memory_mcp(
     }
     try:
         config, error_type, _ = _effective_mcp_config(
-            mcp_config_path, project_mcp_config_path,
+            mcp_config_path,
+            project_mcp_config_path,
         )
         if error_type:
             result["protocol_probe_status"] = "config_error"
@@ -673,18 +751,22 @@ def _probe_memory_mcp(
         args = server.get("args", [])
         server_env = server.get("env", {})
         if (
-            not isinstance(command, str) or not command.strip()
+            not isinstance(command, str)
+            or not command.strip()
             or not isinstance(args, list)
             or any(not isinstance(arg, str) for arg in args)
             or not isinstance(server_env, dict)
-            or any(not isinstance(key, str) or not isinstance(value, str)
-                   for key, value in server_env.items())
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in server_env.items()
+            )
         ):
             result["protocol_probe_status"] = "invalid_config"
             return result
         allowed_environment_keys = {"PLUGIN_DATA", "LOCALAPPDATA"}
         unsupported_environment = [
-            key for key in server_env
+            key
+            for key in server_env
             if key not in allowed_environment_keys and not key.startswith("AI_MEMORY_")
         ]
         if unsupported_environment:
@@ -700,14 +782,16 @@ def _probe_memory_mcp(
             executable = Path(resolved)
         stem = executable.stem.casefold()
         normalized_args = [arg.casefold() for arg in args]
-        safe_python_entrypoint = (
-            stem in {"python", "python3", "python.exe", "python3.exe"}
-            and normalized_args == ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
-        )
-        safe_script_entrypoint = (
-            stem in {"ai-memory", "ai-memory.exe"}
-            and normalized_args == ["mcp", "serve"]
-        )
+        safe_python_entrypoint = stem in {
+            "python",
+            "python3",
+            "python.exe",
+            "python3.exe",
+        } and normalized_args == ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
+        safe_script_entrypoint = stem in {
+            "ai-memory",
+            "ai-memory.exe",
+        } and normalized_args == ["mcp", "serve"]
         if not (safe_python_entrypoint or safe_script_entrypoint):
             result["protocol_probe_status"] = "unsafe_command_skipped"
             return result
@@ -742,14 +826,19 @@ def _probe_memory_mcp(
                         return len(names), False, False
                     called = await session.call_tool(
                         "memory_search",
-                        {"query": "ai-memory-doctor-smoke", "namespace": "global", "limit": 1},
+                        {
+                            "query": "ai-memory-doctor-smoke",
+                            "namespace": "global",
+                            "limit": 1,
+                        },
                     )
                     return len(names), True, not called.is_error
 
             try:
                 tool_count, required_tools_present, call_verified = asyncio.run(
                     asyncio.wait_for(
-                        _handshake_and_smoke(), timeout=timeout_seconds,
+                        _handshake_and_smoke(),
+                        timeout=timeout_seconds,
                     )
                 )
             except TimeoutError:
@@ -762,17 +851,23 @@ def _probe_memory_mcp(
                 result["protocol_probe_call_status"] = "error"
                 return result
 
-        result.update({
-            "protocol_probe_status": (
-                "verified" if required_tools_present else "incompatible_server"
-            ),
-            "protocol_probe_tool_count": tool_count,
-            "protocol_probe_required_tools_present": required_tools_present,
-            "protocol_probe_call_status": (
-                "verified" if call_verified else "tool_error" if required_tools_present else "not_available"
-            ),
-            "protocol_probe_call_verified": call_verified,
-        })
+        result.update(
+            {
+                "protocol_probe_status": (
+                    "verified" if required_tools_present else "incompatible_server"
+                ),
+                "protocol_probe_tool_count": tool_count,
+                "protocol_probe_required_tools_present": required_tools_present,
+                "protocol_probe_call_status": (
+                    "verified"
+                    if call_verified
+                    else "tool_error"
+                    if required_tools_present
+                    else "not_available"
+                ),
+                "protocol_probe_call_verified": call_verified,
+            }
+        )
         if required_tools_present and not call_verified:
             result["protocol_probe_status"] = "tool_call_error"
         if required_tools_present:
@@ -799,11 +894,14 @@ def collect_diagnostics(
     hooks = _hook_config_check(hooks_config_path)
     hook_log = _hook_log_check(hook_log_path)
     memory_mcp = _memory_mcp_check(
-        mcp_config_path, project_mcp_config_path, expected_project_root,
+        mcp_config_path,
+        project_mcp_config_path,
+        expected_project_root,
     )
     if probe_mcp:
         if memory_mcp["status"] in {
-            "project_scope_mismatch", "project_scope_unverified",
+            "project_scope_mismatch",
+            "project_scope_unverified",
         }:
             probe = {
                 "protocol_probe_status": (
@@ -820,24 +918,26 @@ def collect_diagnostics(
         else:
             probe = _probe_memory_mcp(mcp_config_path, project_mcp_config_path)
         memory_mcp.update(probe)
-        if (
-            memory_mcp["status"] not in {
-                "project_scope_mismatch", "project_scope_unverified",
-            }
-            and probe["protocol_probe_status"] not in {"verified", "not_configured"}
-        ):
+        if memory_mcp["status"] not in {
+            "project_scope_mismatch",
+            "project_scope_unverified",
+        } and probe["protocol_probe_status"] not in {"verified", "not_configured"}:
             memory_mcp["status"] = "probe_" + str(probe["protocol_probe_status"])
     maintainer_actions = _maintainer_check(
-        mcp_config_path, project_mcp_config_path,
+        mcp_config_path,
+        project_mcp_config_path,
     )
     checks = (database, hooks, hook_log)
-    overall = "error" if any(check["status"] == "error" for check in checks) or (
-        memory_mcp["status"] == "error"
-    ) else (
-        "warning"
-        if any(check["status"] != "ok" for check in checks)
-        or memory_mcp["status"] != "configured"
-        else "ok"
+    overall = (
+        "error"
+        if any(check["status"] == "error" for check in checks)
+        or (memory_mcp["status"] == "error")
+        else (
+            "warning"
+            if any(check["status"] != "ok" for check in checks)
+            or memory_mcp["status"] != "configured"
+            else "ok"
+        )
     )
     return {
         "overall": overall,

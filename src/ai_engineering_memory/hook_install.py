@@ -49,12 +49,14 @@ def _is_memory_command(value: Any, event: str) -> bool:
 def _hook_definition(event: str, command: str) -> dict[str, Any]:
     """Формирует запись Codex hook с коротким сообщением состояния."""
     return {
-        "hooks": [{
-            "type": "command",
-            "command": command,
-            "timeout": HOOK_TIMEOUT_SECONDS,
-            "statusMessage": HOOK_STATUS_MESSAGES[event],
-        }],
+        "hooks": [
+            {
+                "type": "command",
+                "command": command,
+                "timeout": HOOK_TIMEOUT_SECONDS,
+                "statusMessage": HOOK_STATUS_MESSAGES[event],
+            }
+        ],
     }
 
 
@@ -69,7 +71,9 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def merge_hook_config(
-    document: dict[str, Any], *, executable: str | None = None,
+    document: dict[str, Any],
+    *,
+    executable: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, list[str]]]:
     """Добавляет или обновляет наши hooks, сохраняя остальные настройки."""
     if not isinstance(document, dict):
@@ -94,23 +98,18 @@ def merge_hook_config(
         kept_handler = False
         for definition in definitions:
             if not isinstance(definition, dict):
-                raise TypeError(
-                    f"Запись {event} в hooks.json должна быть объектом"
-                )
+                raise TypeError(f"Запись {event} в hooks.json должна быть объектом")
             handlers = definition.get("hooks", [])
             if not isinstance(handlers, list):
-                raise TypeError(
-                    f"Поле hooks у записи {event} должно быть списком"
-                )
+                raise TypeError(f"Поле hooks у записи {event} должно быть списком")
             retained = []
             for handler in handlers:
                 if not isinstance(handler, dict):
                     raise TypeError(
                         f"Обработчик {event} в hooks.json должен быть объектом"
                     )
-                if (
-                    handler.get("type") == "command"
-                    and _is_memory_command(handler.get("command"), event)
+                if handler.get("type") == "command" and _is_memory_command(
+                    handler.get("command"), event
                 ):
                     if kept_handler:
                         record_change(event, "duplicate_memory_handler_removed")
@@ -147,7 +146,9 @@ def _backup_path(path: Path) -> Path:
 
 
 def install_hooks(
-    config_path: str | Path | None = None, *, executable: str | None = None,
+    config_path: str | Path | None = None,
+    *,
+    executable: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     """Устанавливает hooks атомарно и сохраняет исходную конфигурацию в backup."""
@@ -187,8 +188,13 @@ def install_hooks(
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
-            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
         ) as stream:
             temporary_path = Path(stream.name)
             json.dump(updated, stream, ensure_ascii=False, indent=2)

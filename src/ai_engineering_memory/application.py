@@ -5,9 +5,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from ai_engineering_memory.plugin_api import SearchBackend, SearchHit, SearchQuery
 from ai_engineering_memory.ports import (
     AdminRepository,
     KnowledgeRepository,
+    LearningAnalysisProvider,
     LearningRepository,
     LearningWorkflow,
     SkillsRepository,
@@ -17,9 +19,15 @@ from ai_engineering_memory.ports import (
 class MemoryService:
     """Оркестрирует пользовательские сценарии поверх порта знаний."""
 
-    def __init__(self, knowledge: KnowledgeRepository):
-        """Принимает порт репозитория без привязки к базе или транспорту."""
+    def __init__(
+        self,
+        knowledge: KnowledgeRepository,
+        *,
+        search_backend: SearchBackend | None = None,
+    ):
+        """Принимает репозиторий и необязательный явно выбранный search backend."""
         self._knowledge = knowledge
+        self._search_backend = search_backend
 
     def search(
         self,
@@ -32,7 +40,65 @@ class MemoryService:
         prompt_context: bool = False,
         read_only: bool = False,
     ) -> list[dict[str, Any]]:
-        """Ищет знания с явными фильтрами и сохранением default approved."""
+        """Ищет знания с проверкой фильтров ядром и default approved."""
+        if self._search_backend is not None:
+            self._validate_plugin_search(
+                query,
+                namespace=namespace,
+                status=status,
+                category=category,
+                limit=limit,
+                prompt_context=prompt_context,
+            )
+            query = query.strip()
+            namespace = namespace.strip() if namespace is not None else None
+            status = status.strip() if status is not None else None
+            category = category.strip() if category is not None else None
+            hits = self._search_backend.search(
+                SearchQuery(
+                    text=query,
+                    namespace=namespace,
+                    status=status,
+                    category=category,
+                    limit=limit,
+                    prompt_context=prompt_context,
+                    read_only=read_only,
+                )
+            )
+            seen_ids: set[int] = set()
+            ordered_ids: list[int] = []
+            for hit in hits:
+                if (
+                    not isinstance(hit, SearchHit)
+                    or type(hit.knowledge_id) is not int
+                    or hit.knowledge_id <= 0
+                    or hit.knowledge_id in seen_ids
+                ):
+                    continue
+                seen_ids.add(hit.knowledge_id)
+                ordered_ids.append(hit.knowledge_id)
+                if len(ordered_ids) >= 900:
+                    break
+            canonical_rows = self._knowledge.get_by_ids(
+                ordered_ids,
+                read_only=read_only,
+            )
+            rows_by_id = {row["id"]: row for row in canonical_rows}
+            results: list[dict[str, Any]] = []
+            for knowledge_id in ordered_ids:
+                row = rows_by_id.get(knowledge_id)
+                if row is None:
+                    continue
+                if namespace is not None and row.get("namespace") != namespace:
+                    continue
+                if status is not None and row.get("status") != status:
+                    continue
+                if category is not None and row.get("category") != category:
+                    continue
+                results.append(row)
+                if len(results) >= limit:
+                    break
+            return results
         return self._knowledge.search(
             query,
             namespace=namespace,
@@ -42,6 +108,44 @@ class MemoryService:
             prompt_context=prompt_context,
             read_only=read_only,
         )
+
+    @staticmethod
+    def _validate_plugin_search(
+        query: str,
+        *,
+        namespace: str | None,
+        status: str | None,
+        category: str | None,
+        limit: int,
+        prompt_context: bool,
+    ) -> None:
+        """Сохраняет лимиты SQLite-поиска при использовании внешнего backend."""
+        maximum = 10_000 if prompt_context else 500
+        if not isinstance(query, str) or not query.strip() or len(query) > maximum:
+            raise ValueError(f"query должен содержать от 1 до {maximum} символов")
+        if status is not None and (
+            not isinstance(status, str)
+            or status.strip()
+            not in {
+                "candidate",
+                "approved",
+                "rejected",
+                "deprecated",
+            }
+        ):
+            raise ValueError("Недопустимый статус знания")
+        if category is not None and (
+            not isinstance(category, str) or not category.strip() or len(category) > 200
+        ):
+            raise ValueError("category должна содержать от 1 до 200 символов")
+        if namespace is not None and (
+            not isinstance(namespace, str)
+            or not namespace.strip()
+            or len(namespace) > 200
+        ):
+            raise ValueError("namespace должна содержать от 1 до 200 символов")
+        if not 1 <= limit <= 100:
+            raise ValueError("limit должен быть от 1 до 100")
 
     def get(self, knowledge_id: int) -> dict[str, Any] | None:
         """Возвращает запись без изменения её жизненного цикла."""
@@ -64,7 +168,9 @@ class MemoryService:
     ) -> list[dict[str, Any]]:
         """Возвращает список с фильтрами, заданными вызывающим адаптером."""
         return self._knowledge.list_knowledge(
-            status=status, namespace=namespace, limit=limit,
+            status=status,
+            namespace=namespace,
+            limit=limit,
         )
 
     def create_candidate(
@@ -86,7 +192,10 @@ class MemoryService:
         )
 
     def list_candidates(
-        self, *, namespace: str, limit: int = 100,
+        self,
+        *,
+        namespace: str,
+        limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Перечисляет candidates в одном namespace."""
         return self._knowledge.list_candidates(namespace=namespace, limit=limit)
@@ -127,10 +236,12 @@ class LearningService:
         self,
         repository: LearningRepository,
         workflow: LearningWorkflow,
+        analyzer_provider: LearningAnalysisProvider | None = None,
     ):
         """Принимает порты persistence и learning workflow."""
         self._repository = repository
         self._workflow = workflow
+        self._analyzer_provider = analyzer_provider
 
     def verify_command(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Запускает verifier через внедрённый workflow."""
@@ -155,7 +266,10 @@ class LearningService:
         return self._workflow.submit_codex_candidate(**candidate)
 
     def ingest_task_event(
-        self, event: dict[str, Any], *, allowed_namespaces: Sequence[str],
+        self,
+        event: dict[str, Any],
+        *,
+        allowed_namespaces: Sequence[str],
     ) -> dict[str, Any]:
         """Сохраняет только событие из разрешённого namespace без проверки статуса."""
         project_id = event.get("project_id")
@@ -166,7 +280,10 @@ class LearningService:
         return self._repository.ingest_task_event(event)
 
     def get_task_status(
-        self, event_id: str, *, allowed_namespaces: Sequence[str],
+        self,
+        event_id: str,
+        *,
+        allowed_namespaces: Sequence[str],
     ) -> dict[str, Any] | None:
         """Не раскрывает статус события за пределами разрешённых пространств."""
         event = self._repository.get_task_status(event_id)
@@ -183,7 +300,10 @@ class LearningService:
         return self._repository.list_events(limit=limit)
 
     def list_attempts(
-        self, *, limit: int, failed_only: bool,
+        self,
+        *,
+        limit: int,
+        failed_only: bool,
     ) -> list[dict[str, Any]]:
         """Возвращает метаданные verifier без исходной команды и вывода."""
         return self._repository.list_attempts(limit=limit, failed_only=failed_only)
@@ -193,14 +313,22 @@ class LearningService:
         self._repository.retry_event(event_id)
 
     def withdraw_candidate(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]:
         """Отзывает candidate через audit-capable repository."""
         return self._repository.withdraw_candidate(knowledge_id, reason=reason)
 
     def process_pending(self, *, limit: int) -> dict[str, Any]:
         """Вызывает существующий opt-in анализатор очереди."""
-        return self._workflow.process_pending(limit=limit)
+        if self._analyzer_provider is None:
+            return self._workflow.process_pending(limit=limit)
+        return self._workflow.process_pending(
+            limit=limit,
+            provider=self._analyzer_provider,
+        )
 
 
 class SkillsService:
@@ -217,11 +345,18 @@ class SkillsService:
         return self._repository.get_skill(name)
 
     def propose_update(
-        self, skill_name: str, proposer: str, description: str, content: str,
+        self,
+        skill_name: str,
+        proposer: str,
+        description: str,
+        content: str,
     ) -> dict[str, str]:
         """Создаёт предложение-кандидат, не меняя активный Skill."""
         proposal_id = self._repository.propose_update(
-            skill_name, proposer, description, content,
+            skill_name,
+            proposer,
+            description,
+            content,
         )
         return {"proposal_id": proposal_id, "status": "candidate"}
 
@@ -246,7 +381,10 @@ class AdminService:
         return self._repository.approve_knowledge(knowledge_id)
 
     def reject_knowledge(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]:
         if not reason.strip():
             raise ValueError("Причина отклонения обязательна")
@@ -256,18 +394,31 @@ class AdminService:
         return self._repository.deprecate_knowledge(knowledge_id)
 
     def decide_skill_proposal(
-        self, proposal_id: str, *, decision: str,
-        maintainer: str, reason: str = "",
+        self,
+        proposal_id: str,
+        *,
+        decision: str,
+        maintainer: str,
+        reason: str = "",
     ) -> dict[str, Any]:
         if decision == "rejected" and not reason.strip():
             raise ValueError("Причина отклонения Skill обязательна")
         return self._repository.decide_skill_proposal(
-            proposal_id, decision=decision, maintainer=maintainer, reason=reason,
+            proposal_id,
+            decision=decision,
+            maintainer=maintainer,
+            reason=reason,
         )
 
     def rollback_skill_version(
-        self, skill_name: str, version: str, *, maintainer: str,
+        self,
+        skill_name: str,
+        version: str,
+        *,
+        maintainer: str,
     ) -> dict[str, Any]:
         return self._repository.rollback_skill_version(
-            skill_name, version, maintainer=maintainer,
+            skill_name,
+            version,
+            maintainer=maintainer,
         )

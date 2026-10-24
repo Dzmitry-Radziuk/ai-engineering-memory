@@ -8,20 +8,26 @@ import sys
 from contextlib import closing
 from pathlib import Path
 
+import pytest
+
 from ai_engineering_memory import cli, codex_hooks, diagnostics, hook_install, storage
 
 
 def _write_hook_config(path):
     """Создаёт временную конфигурацию с обоими ожидаемыми hooks."""
     hooks = {
-        event: [{
-            "hooks": [{
-                "type": "command",
-                "command": f'"{sys.executable}" -m ai_engineering_memory.codex_hooks {event}',
-                "timeout": hook_install.HOOK_TIMEOUT_SECONDS,
-                "statusMessage": hook_install.HOOK_STATUS_MESSAGES[event],
-            }],
-        }]
+        event: [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'"{sys.executable}" -m ai_engineering_memory.codex_hooks {event}',
+                        "timeout": hook_install.HOOK_TIMEOUT_SECONDS,
+                        "statusMessage": hook_install.HOOK_STATUS_MESSAGES[event],
+                    }
+                ],
+            }
+        ]
         for event in ("UserPromptSubmit", "Stop")
     }
     path.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
@@ -32,28 +38,38 @@ def test_diagnostics_checks_database_hooks_and_redacted_log(tmp_path):
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
     before_database = database.read_bytes()
 
     hook_config = tmp_path / "hooks.json"
     _write_hook_config(hook_config)
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        json.dumps({
-            "event": "UserPromptSubmit",
-            "timestamp": "2026-10-23T10:00:00+00:00",
-            "source": "ai-engineering-memory:1.5.3",
-            "result": "success",
-            "duration_ms": 12,
-            "prompt": "PRIVATE-PROMPT-MUST-NOT-LEAK",
-        }) + "\n" + json.dumps({
-            "event": "Stop",
-            "timestamp": "2026-10-23T10:01:00+00:00",
-            "result": "error",
-            "duration_ms": 4,
-            "error_type": "ValueError",
-            "response": "PRIVATE-RESPONSE-MUST-NOT-LEAK",
-        }) + "\n",
+        json.dumps(
+            {
+                "event": "UserPromptSubmit",
+                "timestamp": "2026-10-23T10:00:00+00:00",
+                "source": "ai-engineering-memory:1.5.3",
+                "result": "success",
+                "duration_ms": 12,
+                "prompt": "PRIVATE-PROMPT-MUST-NOT-LEAK",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "event": "Stop",
+                "timestamp": "2026-10-23T10:01:00+00:00",
+                "result": "error",
+                "duration_ms": 4,
+                "error_type": "ValueError",
+                "response": "PRIVATE-RESPONSE-MUST-NOT-LEAK",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     before_log = hook_log.read_bytes()
@@ -67,12 +83,14 @@ def test_diagnostics_checks_database_hooks_and_redacted_log(tmp_path):
     serialized = json.dumps(report)
     assert report["overall"] == "warning"
     assert report["database"]["integrity"] == "ok"
-    assert report["database"]["schema_version"] == 5
+    assert report["database"]["schema_version"] == storage.LATEST_SCHEMA_VERSION
     assert report["hooks"]["events"] == {
-        "UserPromptSubmit": "ok", "Stop": "ok",
+        "UserPromptSubmit": "ok",
+        "Stop": "ok",
     }
     assert report["hooks"]["launcher_matches_current_interpreter"] == {
-        "UserPromptSubmit": True, "Stop": True,
+        "UserPromptSubmit": True,
+        "Stop": True,
     }
     assert report["hook_log"]["error_count"] == 1
     assert report["hook_log"]["missing_events"] == []
@@ -111,12 +129,17 @@ def test_diagnostics_reports_missing_installation_without_creating_files(tmp_pat
     assert report["memory_mcp"]["status"] == "not_checked"
 
 
-def test_database_check_reports_lifecycle_counts_without_reading_record_content(tmp_path):
+def test_database_check_reports_lifecycle_counts_without_reading_record_content(
+    tmp_path,
+):
     """Read-only diagnosis exposes lifecycle counts, never stored knowledge text."""
     database = tmp_path / "memory-counts.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
         connection.execute(
             "CREATE TABLE knowledge "
             "(id INTEGER PRIMARY KEY, namespace TEXT, status TEXT, title TEXT)"
@@ -177,9 +200,12 @@ def test_memory_mcp_check_reports_safe_launch_state_without_secrets(tmp_path):
     result = diagnostics._memory_mcp_check(config, expected_project_root=tmp_path)
 
     assert result == {
-        "status": "configured", "configured": True,
-        "launcher_available": True, "entrypoint_valid": True,
-        "runtime_verified": False, "project_scope": "configured_root",
+        "status": "configured",
+        "configured": True,
+        "launcher_available": True,
+        "entrypoint_valid": True,
+        "runtime_verified": False,
+        "project_scope": "configured_root",
         "project_scope_match": "matched",
         "config_scope": "user",
     }
@@ -225,7 +251,8 @@ def test_memory_mcp_check_detects_configured_root_for_another_project(tmp_path):
     )
 
     result = diagnostics._memory_mcp_check(
-        config, expected_project_root=expected_root,
+        config,
+        expected_project_root=expected_root,
     )
 
     assert result["status"] == "project_scope_mismatch"
@@ -251,7 +278,8 @@ def test_memory_mcp_check_detects_explicit_cwd_for_another_project(tmp_path):
     )
 
     result = diagnostics._memory_mcp_check(
-        config, expected_project_root=expected_root,
+        config,
+        expected_project_root=expected_root,
     )
 
     assert result["status"] == "project_scope_mismatch"
@@ -276,7 +304,8 @@ def test_memory_mcp_check_matches_cwd_subdirectory_to_git_project_root(tmp_path)
     )
 
     result = diagnostics._memory_mcp_check(
-        config, expected_project_root=project_root,
+        config,
+        expected_project_root=project_root,
     )
 
     assert result["status"] == "configured"
@@ -297,7 +326,8 @@ def test_memory_mcp_check_marks_relative_cwd_unverified(tmp_path):
     )
 
     result = diagnostics._memory_mcp_check(
-        config, expected_project_root=project_root,
+        config,
+        expected_project_root=project_root,
     )
 
     assert result["status"] == "project_scope_unverified"
@@ -323,7 +353,8 @@ def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypa
     )
     probe_calls = []
     monkeypatch.setattr(
-        diagnostics, "_probe_memory_mcp",
+        diagnostics,
+        "_probe_memory_mcp",
         lambda *args, **kwargs: probe_calls.append((args, kwargs)),
     )
 
@@ -337,7 +368,10 @@ def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypa
     )
 
     assert report["memory_mcp"]["status"] == "project_scope_mismatch"
-    assert report["memory_mcp"]["protocol_probe_status"] == "skipped_project_scope_mismatch"
+    assert (
+        report["memory_mcp"]["protocol_probe_status"]
+        == "skipped_project_scope_mismatch"
+    )
     assert probe_calls == []
 
 
@@ -354,7 +388,8 @@ def test_doctor_skips_mcp_probe_when_project_scope_is_unverified(tmp_path, monke
     )
     probe_calls = []
     monkeypatch.setattr(
-        diagnostics, "_probe_memory_mcp",
+        diagnostics,
+        "_probe_memory_mcp",
         lambda *args, **kwargs: probe_calls.append((args, kwargs)),
     )
 
@@ -368,7 +403,10 @@ def test_doctor_skips_mcp_probe_when_project_scope_is_unverified(tmp_path, monke
     )
 
     assert report["memory_mcp"]["status"] == "project_scope_unverified"
-    assert report["memory_mcp"]["protocol_probe_status"] == "skipped_project_scope_unverified"
+    assert (
+        report["memory_mcp"]["protocol_probe_status"]
+        == "skipped_project_scope_unverified"
+    )
     assert probe_calls == []
 
 
@@ -394,7 +432,9 @@ def test_memory_mcp_check_merges_project_override_and_inherited_maintainer(tmp_p
     )
 
     result = diagnostics._memory_mcp_check(
-        user_config, project_config, expected_project_root=project_root,
+        user_config,
+        project_config,
+        expected_project_root=project_root,
     )
     maintainer = diagnostics._maintainer_check(user_config, project_config)
 
@@ -435,7 +475,10 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
     _write_hook_config(codex_home / "hooks.json")
@@ -458,14 +501,21 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     )
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps({
-            "event": event,
-            "timestamp": "2026-10-23T10:00:00+00:00",
-            "source": codex_hooks.HOOK_SOURCE,
-            "result": result,
-        }) for event, result in (
-            ("UserPromptSubmit", "success"), ("Stop", "no_marker_seen"),
-        )) + "\n",
+        "\n".join(
+            json.dumps(
+                {
+                    "event": event,
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": result,
+                }
+            )
+            for event, result in (
+                ("UserPromptSubmit", "success"),
+                ("Stop", "no_marker_seen"),
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -494,8 +544,7 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     nested_codex = nested_cwd / ".codex"
     nested_codex.mkdir()
     (nested_codex / "config.toml").write_text(
-        "[mcp_servers.ai_engineering_memory]\n"
-        "enabled = false\n",
+        "[mcp_servers.ai_engineering_memory]\nenabled = false\n",
         encoding="utf-8",
     )
     assert cli.main(["doctor", "--cwd", str(nested_cwd), "--json"]) == 1
@@ -544,7 +593,7 @@ def test_doctor_mcp_probe_skips_unrecognized_command_without_executing_it(tmp_pa
     config.write_text(
         "[mcp_servers.ai_engineering_memory]\n"
         f"command = {json.dumps(sys.executable)}\n"
-        f"args = [\"-c\", {json.dumps(payload)}]\n",
+        f'args = ["-c", {json.dumps(payload)}]\n',
         encoding="utf-8",
     )
 
@@ -568,6 +617,75 @@ def test_doctor_mcp_probe_skips_environment_that_can_change_python_execution(tmp
     result = diagnostics._probe_memory_mcp(config)
 
     assert result["protocol_probe_status"] == "unsupported_environment_skipped"
+
+
+@pytest.mark.parametrize(
+    ("configuration", "expected_status"),
+    [
+        pytest.param("not = [valid toml", "config_error", id="malformed-toml"),
+        pytest.param(
+            "[mcp_servers.ai_engineering_memory]\nenabled = false\n",
+            "disabled",
+            id="disabled-server",
+        ),
+        pytest.param(
+            '[mcp_servers.ai_engineering_memory.env]\nPYTHONPATH = "unsafe"\n',
+            "invalid_config",
+            id="invalid-server-shape",
+        ),
+        pytest.param(
+            "[mcp_servers.ai_engineering_memory]\n"
+            'command = "python"\nargs = []\n'
+            "[mcp_servers.ai_engineering_memory.env]\n"
+            'PYTHONPATH = "unsafe"\n',
+            "unsupported_environment_skipped",
+            id="unsupported-environment",
+        ),
+        pytest.param(
+            "[mcp_servers.ai_engineering_memory]\n"
+            'command = "ai-memory-launcher-that-does-not-exist"\n'
+            'args = ["mcp", "serve"]\n',
+            "launcher_unavailable",
+            id="missing-launcher",
+        ),
+        pytest.param(
+            "[mcp_servers.ai_engineering_memory]\n"
+            f"command = {json.dumps(sys.executable)}\n"
+            'args = ["-m", "unrecognized.module"]\n',
+            "unsafe_command_skipped",
+            id="unrecognized-entrypoint",
+        ),
+        pytest.param(
+            "[mcp_servers.ai_engineering_memory]\n"
+            f"command = {json.dumps(sys.executable)}\n"
+            'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+            "cwd = 7\n",
+            "invalid_config",
+            id="invalid-cwd",
+        ),
+    ],
+)
+def test_doctor_mcp_probe_refuses_unusable_or_unsafe_configs(
+    tmp_path, configuration, expected_status
+):
+    """Не запускает MCP при повреждённой или небезопасной конфигурации."""
+    config = tmp_path / "config.toml"
+    config.write_text(configuration, encoding="utf-8")
+
+    result = diagnostics._probe_memory_mcp(config)
+
+    assert result["protocol_probe_status"] == expected_status
+    assert result["protocol_probe_database_scope"] == "not_used"
+
+
+def test_doctor_mcp_probe_reports_missing_config_without_running_process(tmp_path):
+    """Отличает отсутствующую конфигурацию и не создаёт её при диагностике."""
+    config = tmp_path / "missing.toml"
+
+    result = diagnostics._probe_memory_mcp(config)
+
+    assert result["protocol_probe_status"] == "missing_config"
+    assert not config.exists()
 
 
 def test_memory_mcp_check_distinguishes_missing_disabled_and_incomplete(tmp_path):
@@ -603,7 +721,7 @@ def test_maintainer_diagnostic_reports_only_configuration_state(tmp_path, monkey
 
     mcp_config = tmp_path / "config.toml"
     mcp_config.write_text(
-        '[mcp_servers.ai_engineering_memory.env]\n'
+        "[mcp_servers.ai_engineering_memory.env]\n"
         'AI_MEMORY_MAINTAINER = "private-maintainer-name"\n',
         encoding="utf-8",
     )
@@ -623,12 +741,17 @@ def test_maintainer_diagnostic_reports_only_configuration_state(tmp_path, monkey
     assert "AI_MEMORY_MAINTAINER" not in json.dumps(malformed)
 
 
-def test_diagnostics_does_not_warn_for_unexposed_maintainer_actions(tmp_path, monkeypatch):
+def test_diagnostics_does_not_warn_for_unexposed_maintainer_actions(
+    tmp_path, monkeypatch
+):
     """Не помечает готовой установку, где MCP не может менять статусы знаний и Skills."""
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
     hook_config = tmp_path / "hooks.json"
     _write_hook_config(hook_config)
     mcp_config = tmp_path / "config.toml"
@@ -640,12 +763,21 @@ def test_diagnostics_does_not_warn_for_unexposed_maintainer_actions(tmp_path, mo
     )
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps({
-            "event": event, "timestamp": "2026-10-23T10:00:00+00:00",
-            "result": result, "duration_ms": 2,
-        }) for event, result in (
-            ("UserPromptSubmit", "success"), ("Stop", "no_verified_marker"),
-        )) + "\n",
+        "\n".join(
+            json.dumps(
+                {
+                    "event": event,
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "result": result,
+                    "duration_ms": 2,
+                }
+            )
+            for event, result in (
+                ("UserPromptSubmit", "success"),
+                ("Stop", "no_verified_marker"),
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("AI_MEMORY_MAINTAINER", raising=False)
@@ -677,10 +809,10 @@ def test_diagnostics_does_not_warn_for_unexposed_maintainer_actions(tmp_path, mo
 
     monkeypatch.delenv("AI_MEMORY_MAINTAINER", raising=False)
     mcp_config.write_text(
-        '[mcp_servers.ai_engineering_memory]\n'
+        "[mcp_servers.ai_engineering_memory]\n"
         "command = 'python'\n"
         "args = ['-m', 'ai_engineering_memory.cli', 'mcp', 'serve']\n"
-        '[mcp_servers.ai_engineering_memory.env]\n'
+        "[mcp_servers.ai_engineering_memory.env]\n"
         'AI_MEMORY_MAINTAINER = "configured-owner"\n',
         encoding="utf-8",
     )
@@ -706,9 +838,12 @@ def test_stale_database_schema_has_explicit_safe_recommendation(tmp_path):
     assert report["schema_version"] == 3
     assert "ai-memory init" in report["recommendation"]
     with closing(sqlite3.connect(database)) as connection, connection:
-        assert connection.execute(
-            "SELECT MAX(version) FROM schema_migrations"
-        ).fetchone()[0] == 3
+        assert (
+            connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[
+                0
+            ]
+            == 3
+        )
 
 
 def test_read_only_database_check_creates_no_wal_sidecars(tmp_path):
@@ -717,7 +852,10 @@ def test_read_only_database_check_creates_no_wal_sidecars(tmp_path):
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
     before = {path.name for path in tmp_path.iterdir()}
 
     report = diagnostics._database_check(database)
@@ -725,6 +863,53 @@ def test_read_only_database_check_creates_no_wal_sidecars(tmp_path):
     after = {path.name for path in tmp_path.iterdir()}
     assert report["status"] == "ok"
     assert after == before
+    assert report["database_size_bytes"] == database.stat().st_size
+    assert report["wal_size_bytes"] == 0
+    assert report["fts_available"] is False
+
+
+def test_hook_log_diagnostics_aggregate_only_valid_durations(tmp_path):
+    """Doctor summarizes recent retrieval and hook timings without log content."""
+    log_path = tmp_path / "hooks.jsonl"
+    log_path.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "event": "UserPromptSubmit",
+                    "duration_ms": 25,
+                    "search_duration_ms": 10,
+                    "prompt": "do not expose this prompt",
+                },
+                {
+                    "event": "UserPromptSubmit",
+                    "duration_ms": 40,
+                    "search_duration_ms": 20,
+                },
+                {"event": "Stop", "duration_ms": True, "search_duration_ms": 90},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = diagnostics._hook_log_check(log_path)
+
+    assert report["duration_summary_ms"] == {
+        "count": 2,
+        "min_ms": 25,
+        "mean_ms": 32.5,
+        "p95_ms": 40,
+        "max_ms": 40,
+    }
+    assert report["search_duration_summary_ms"] == {
+        "count": 2,
+        "min_ms": 10,
+        "mean_ms": 15,
+        "p95_ms": 20,
+        "max_ms": 20,
+    }
+    assert "do not expose this prompt" not in json.dumps(report)
 
 
 def test_active_wal_is_skipped_without_touching_database(tmp_path):
@@ -733,7 +918,10 @@ def test_active_wal_is_skipped_without_touching_database(tmp_path):
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-    connection.execute("INSERT INTO schema_migrations VALUES (5)")
+    connection.execute(
+        "INSERT INTO schema_migrations VALUES (?)",
+        (storage.LATEST_SCHEMA_VERSION,),
+    )
     connection.commit()
     wal_path = tmp_path / "active-memory.db-wal"
     assert wal_path.stat().st_size > 0
@@ -749,14 +937,19 @@ def test_active_wal_is_skipped_without_touching_database(tmp_path):
 def test_diagnostics_does_not_echo_untrusted_log_values(tmp_path):
     """Неожиданные поля в JSONL не попадают в диагностический отчёт."""
     hook_log = tmp_path / "hooks.jsonl"
-    hook_log.write_text(json.dumps({
-        "event": "Stop",
-        "timestamp": "PRIVATE-TIMESTAMP",
-        "result": "PRIVATE-RESULT",
-        "source": "PRIVATE-SOURCE",
-        "duration_ms": -1,
-        "error_type": "PRIVATE-ERROR-TYPE",
-    }), encoding="utf-8")
+    hook_log.write_text(
+        json.dumps(
+            {
+                "event": "Stop",
+                "timestamp": "PRIVATE-TIMESTAMP",
+                "result": "PRIVATE-RESULT",
+                "source": "PRIVATE-SOURCE",
+                "duration_ms": -1,
+                "error_type": "PRIVATE-ERROR-TYPE",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     report = diagnostics._hook_log_check(hook_log)
 
@@ -766,6 +959,7 @@ def test_diagnostics_does_not_echo_untrusted_log_values(tmp_path):
         "source": None,
         "result": None,
         "duration_ms": None,
+        "search_duration_ms": None,
         "learning_instruction_injected": None,
         "error_type": None,
     }
@@ -778,20 +972,24 @@ def test_diagnostics_warns_when_latest_hook_source_is_stale(tmp_path):
     """Последняя запись старой версии должна быть видна как устаревшая."""
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps(record) for record in (
-            {
-                "event": "UserPromptSubmit",
-                "timestamp": "2026-10-23T10:00:00+00:00",
-                "source": "ai-engineering-memory:1.5.2",
-                "result": "success",
-            },
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:01:00+00:00",
-                "source": codex_hooks.HOOK_SOURCE,
-                "result": "no_marker_seen",
-            },
-        )) + "\n",
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "event": "UserPromptSubmit",
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "source": "ai-engineering-memory:1.5.2",
+                    "result": "success",
+                },
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:01:00+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": "no_marker_seen",
+                },
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -806,24 +1004,28 @@ def test_stop_marker_results_are_valid_diagnostics(tmp_path):
     """Новые диагностические статусы Stop не выглядят ошибками или повреждением."""
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps(record) for record in (
-            {
-                "event": "UserPromptSubmit",
-                "timestamp": "2026-10-23T10:00:00+00:00",
-                "source": codex_hooks.HOOK_SOURCE,
-                "result": "success",
-            },
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:01:00+00:00",
-                "result": "marker_present_unverified",
-            },
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:02:00+00:00",
-                "result": "no_marker_seen",
-            },
-        )) + "\n",
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "event": "UserPromptSubmit",
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": "success",
+                },
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:01:00+00:00",
+                    "result": "marker_present_unverified",
+                },
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:02:00+00:00",
+                    "result": "no_marker_seen",
+                },
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -840,25 +1042,29 @@ def test_recovered_hook_event_does_not_keep_current_status_in_warning(tmp_path):
     """Историческая ошибка остаётся видна, но успешный последний запуск снимает warning."""
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps(record) for record in (
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:00:00+00:00",
-                "result": "error",
-                "error_type": "RuntimeError",
-            },
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:01:00+00:00",
-                "result": "no_verified_marker",
-            },
-            {
-                "event": "UserPromptSubmit",
-                "timestamp": "2026-10-23T10:02:00+00:00",
-                "source": codex_hooks.HOOK_SOURCE,
-                "result": "success",
-            },
-        )) + "\n",
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "result": "error",
+                    "error_type": "RuntimeError",
+                },
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:01:00+00:00",
+                    "result": "no_verified_marker",
+                },
+                {
+                    "event": "UserPromptSubmit",
+                    "timestamp": "2026-10-23T10:02:00+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": "success",
+                },
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -875,13 +1081,17 @@ def test_hook_config_warns_when_launcher_path_is_missing(tmp_path):
     """Зарегистрированный hook с отсутствующим executable не считается готовым."""
     config = tmp_path / "hooks.json"
     hooks = {
-        event: [{
-            "hooks": [{
-                "type": "command",
-                "command": f'"{tmp_path / "removed" / "python.exe"}" '
-                f"-m ai_engineering_memory.codex_hooks {event}",
-            }],
-        }]
+        event: [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'"{tmp_path / "removed" / "python.exe"}" '
+                        f"-m ai_engineering_memory.codex_hooks {event}",
+                    }
+                ],
+            }
+        ]
         for event in ("UserPromptSubmit", "Stop")
     }
     config.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
@@ -892,7 +1102,8 @@ def test_hook_config_warns_when_launcher_path_is_missing(tmp_path):
     assert result["events"] == {"UserPromptSubmit": "ok", "Stop": "ok"}
     assert result["launchers"] == {"UserPromptSubmit": False, "Stop": False}
     assert result["launcher_matches_current_interpreter"] == {
-        "UserPromptSubmit": False, "Stop": False,
+        "UserPromptSubmit": False,
+        "Stop": False,
     }
 
 
@@ -942,7 +1153,10 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (5)")
+        connection.execute(
+            "INSERT INTO schema_migrations VALUES (?)",
+            (storage.LATEST_SCHEMA_VERSION,),
+        )
         connection.execute(
             "CREATE TABLE knowledge "
             "(id INTEGER PRIMARY KEY, namespace TEXT, status TEXT, title TEXT)"
@@ -978,31 +1192,35 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     )
     hook_log = tmp_path / "hooks.jsonl"
     hook_log.write_text(
-        "\n".join(json.dumps(record) for record in (
-            {
-                "event": "UserPromptSubmit",
-                "timestamp": "2026-10-23T10:00:00+00:00",
-                "source": codex_hooks.HOOK_SOURCE,
-                "result": "error",
-                "duration_ms": 7,
-                "error_type": "RuntimeError",
-            },
-            {
-                "event": "UserPromptSubmit",
-                "timestamp": "2026-10-23T10:00:30+00:00",
-                "source": codex_hooks.HOOK_SOURCE,
-                "result": "success",
-                "duration_ms": 2,
-                "learning_instruction_injected": True,
-            },
-            {
-                "event": "Stop",
-                "timestamp": "2026-10-23T10:01:00+00:00",
-                "source": "ai-engineering-memory:1.5.2",
-                "result": "marker_present_unverified",
-                "duration_ms": 3,
-            },
-        )) + "\n",
+        "\n".join(
+            json.dumps(record)
+            for record in (
+                {
+                    "event": "UserPromptSubmit",
+                    "timestamp": "2026-10-23T10:00:00+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": "error",
+                    "duration_ms": 7,
+                    "error_type": "RuntimeError",
+                },
+                {
+                    "event": "UserPromptSubmit",
+                    "timestamp": "2026-10-23T10:00:30+00:00",
+                    "source": codex_hooks.HOOK_SOURCE,
+                    "result": "success",
+                    "duration_ms": 2,
+                    "learning_instruction_injected": True,
+                },
+                {
+                    "event": "Stop",
+                    "timestamp": "2026-10-23T10:01:00+00:00",
+                    "source": "ai-engineering-memory:1.5.2",
+                    "result": "marker_present_unverified",
+                    "duration_ms": 3,
+                },
+            )
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -1014,7 +1232,11 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     monkeypatch.delenv("AI_MEMORY_MAINTAINER", raising=False)
 
     assert cli.main(["doctor", "--json"]) == 1
-    report = json.loads(capsys.readouterr().out)
+    default_json = capsys.readouterr().out
+    report = json.loads(default_json)
+    assert "path" not in report["database"]
+    assert "path" not in report["hooks"]
+    assert str(tmp_path) not in default_json
     assert report["overall"] == "warning"
     assert report["maintainer_actions"]["status"] == "not_exposed"
     assert report["hooks"]["metadata_mismatch_events"] == ["Stop"]
@@ -1023,9 +1245,12 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
         "status_message_matches_expected": False,
     }
     assert report["hook_log"]["events"]["Stop"]["result"] == "marker_present_unverified"
-    assert report["hook_log"]["events"]["UserPromptSubmit"][
-        "learning_instruction_injected"
-    ] is True
+    assert (
+        report["hook_log"]["events"]["UserPromptSubmit"][
+            "learning_instruction_injected"
+        ]
+        is True
+    )
     assert report["hook_log"]["error_count"] == 1
     assert report["hook_log"]["latest_error_events"] == []
     assert report["hook_log"]["stale_source_events"] == ["Stop"]
@@ -1043,12 +1268,10 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     }
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
+    assert str(tmp_path) not in output
+    assert "путь скрыт" in output
     assert "not_exposed" in output
     assert "learning_instruction=enabled" in output
-    assert (
-        "Последний запуск UserPromptSubmit: 2026-10-23T10:00:30+00:00 · "
-        "success · ai-engineering-memory:1.5.10 · 2 мс"
-    ) in output
     assert (
         "Последний запуск Stop: 2026-10-23T10:01:00+00:00 · "
         "marker_present_unverified · ai-engineering-memory:1.5.2 · 3 мс"
@@ -1058,7 +1281,10 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert "последнего наблюдавшегося запуска" in output
     assert "не доказывает, что текущая настройка устарела" in output
     assert "statusMessage" in output
-    assert "не мешает запуску" in output
+    assert (
+        "\u043d\u0435 \u043c\u0435\u0448\u0430\u0435\u0442 \u0437\u0430\u043f\u0443\u0441\u043a\u0443"
+        in output
+    )
     assert "hooks install --dry-run" in output
     assert "Область проекта MCP: рабочий каталог процесса MCP" in output
     assert "Знания: всего 1 · candidate=1" in output
@@ -1066,13 +1292,22 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert "межпроектных подтверждений 0" in output
     assert "При смене workspace перезапустите MCP" in output
     assert "Stop не проверяет, запускалась ли" in output
-    hook_log.write_text(json.dumps({
-        "event": "Stop",
-        "timestamp": "2026-10-23T10:02:00+00:00",
-        "source": "ai-engineering-memory:1.5.8",
-        "result": "no_marker_seen",
-        "duration_ms": 1,
-    }), encoding="utf-8")
+    assert cli.main(["doctor", "--json", "--show-paths"]) == 1
+    path_report = json.loads(capsys.readouterr().out)
+    assert path_report["database"]["path"] == str(database)
+    assert path_report["hooks"]["path"] == str(hook_config)
+    hook_log.write_text(
+        json.dumps(
+            {
+                "event": "Stop",
+                "timestamp": "2026-10-23T10:02:00+00:00",
+                "source": "ai-engineering-memory:1.5.8",
+                "result": "no_marker_seen",
+                "duration_ms": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
     assert cli.main(["doctor"]) == 1
     assert "Stop отработал без маркера" in capsys.readouterr().out
     assert database.read_bytes() == before_database

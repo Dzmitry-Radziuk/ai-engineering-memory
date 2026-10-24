@@ -24,21 +24,31 @@ def test_memory_service_preserves_candidate_approval_lifecycle(tmp_path):
     )
 
     assert candidate["status"] == "candidate"
-    assert service.search(
-        "bound retry", namespace="project:service", status="approved",
-    ) == []
-    assert service.search(
-        "bound retry", namespace="project:service", status="candidate",
-    )[0]["id"] == candidate["id"]
+    assert (
+        service.search(
+            "bound retry",
+            namespace="project:service",
+            status="approved",
+        )
+        == []
+    )
+    assert (
+        service.search(
+            "bound retry",
+            namespace="project:service",
+            status="candidate",
+        )[0]["id"]
+        == candidate["id"]
+    )
     store.add_evidence(
-        candidate["id"], kind="test", result="retry boundary checked",
+        candidate["id"],
+        kind="test",
+        result="retry boundary checked",
     )
     assert service.get_evidence(candidate["id"])[0]["result"] == (
         "retry boundary checked"
     )
-    assert service.get_corroboration(candidate["id"])[
-        "independent_project_count"
-    ] == 0
+    assert service.get_corroboration(candidate["id"])["independent_project_count"] == 0
 
 
 def test_memory_service_overview_deduplicates_visible_namespaces(tmp_path):
@@ -47,7 +57,10 @@ def test_memory_service_overview_deduplicates_visible_namespaces(tmp_path):
     store.init_database()
     service = MemoryService(SqliteKnowledgeRepository(store))
     service.create_candidate(
-        "backend", "Scoped", "One record.", namespace="project:visible",
+        "backend",
+        "Scoped",
+        "One record.",
+        namespace="project:visible",
     )
 
     result = service.overview_for_namespaces(
@@ -65,9 +78,14 @@ def test_memory_service_read_only_search_does_not_create_database(tmp_path):
         SqliteKnowledgeRepository(create_storage(Settings(database_path))),
     )
 
-    assert service.search(
-        "retry", namespace="global", read_only=True,
-    ) == []
+    assert (
+        service.search(
+            "retry",
+            namespace="global",
+            read_only=True,
+        )
+        == []
+    )
     assert not database_path.exists()
 
 
@@ -132,16 +150,28 @@ def test_learning_service_scopes_legacy_event_ingest_and_status():
     service = LearningService(repository, Workflow())
     event = {"event_id": "local-event", "project_id": "project:current"}
 
-    assert service.ingest_task_event(
-        event, allowed_namespaces=["global", "project:current"],
-    )["status"] == "waiting_for_verification"
+    assert (
+        service.ingest_task_event(
+            event,
+            allowed_namespaces=["global", "project:current"],
+        )["status"]
+        == "waiting_for_verification"
+    )
     assert repository.saved == event
-    assert service.get_task_status(
-        "local-event", allowed_namespaces=["global", "project:current"],
-    )["event_id"] == "local-event"
-    assert service.get_task_status(
-        "local-event", allowed_namespaces=["global", "project:other"],
-    ) is None
+    assert (
+        service.get_task_status(
+            "local-event",
+            allowed_namespaces=["global", "project:current"],
+        )["event_id"]
+        == "local-event"
+    )
+    assert (
+        service.get_task_status(
+            "local-event",
+            allowed_namespaces=["global", "project:other"],
+        )
+        is None
+    )
     try:
         service.ingest_task_event(
             {"event_id": "foreign-event", "project_id": "project:other"},
@@ -166,7 +196,8 @@ def test_skills_service_proposal_does_not_replace_active_skill(tmp_path, monkeyp
         "  version: 1.0.0\n---\nCurrent active instructions\n"
     )
     proposed = active.replace("1.0.0", "1.1.0").replace(
-        "Current active instructions", "Proposed candidate instructions",
+        "Current active instructions",
+        "Proposed candidate instructions",
     )
     skill_path = skill_dir / "SKILL.md"
     skill_path.write_text(active, encoding="utf-8")
@@ -175,7 +206,10 @@ def test_skills_service_proposal_does_not_replace_active_skill(tmp_path, monkeyp
     store = create_storage(Settings(tmp_path / "skills.sqlite"))
     service = SkillsService(LocalSkillsRepository(store))
     created = service.propose_update(
-        "sample-skill", "agent", "Clarify workflow", proposed,
+        "sample-skill",
+        "agent",
+        "Clarify workflow",
+        proposed,
     )
 
     assert created["status"] == "candidate"

@@ -12,7 +12,9 @@ from ai_engineering_memory.sqlite_repository import LocalAdminRepository
 
 
 def test_cli_knowledge_approval_requires_exact_interactive_confirmation(
-    tmp_path, monkeypatch, capsys,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """Несовпавшая фраза оставляет candidate без изменений."""
     database_path = tmp_path / "admin.sqlite"
@@ -20,7 +22,9 @@ def test_cli_knowledge_approval_requires_exact_interactive_confirmation(
     store = storage.create_storage(Settings(database_path))
     with store.activate():
         candidate = store.create_knowledge(
-            "backend", "Admin review", "Require an explicit human decision.",
+            "backend",
+            "Admin review",
+            "Require an explicit human decision.",
         )
 
     monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
@@ -33,7 +37,9 @@ def test_cli_knowledge_approval_requires_exact_interactive_confirmation(
 
 
 def test_cli_knowledge_approval_applies_after_exact_confirmation(
-    tmp_path, monkeypatch, capsys,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """Точная фраза переводит запись в approved через AdminService."""
     database_path = tmp_path / "approved.sqlite"
@@ -41,7 +47,9 @@ def test_cli_knowledge_approval_applies_after_exact_confirmation(
     store = storage.create_storage(Settings(database_path))
     with store.activate():
         candidate = store.create_knowledge(
-            "backend", "Ready candidate", "A maintainer reviewed this knowledge.",
+            "backend",
+            "Ready candidate",
+            "A maintainer reviewed this knowledge.",
         )
 
     monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))
@@ -68,7 +76,9 @@ def test_admin_service_requires_reason_for_rejection(tmp_path):
 
 
 def test_cli_skill_approval_uses_temporary_skills_root(
-    tmp_path, monkeypatch, capsys,
+    tmp_path,
+    monkeypatch,
+    capsys,
 ):
     """Skill approval writes only to the explicitly isolated fixture directory."""
     database_path = tmp_path / "skill-admin.sqlite"
@@ -80,7 +90,8 @@ def test_cli_skill_approval_uses_temporary_skills_root(
         "  version: 1.0.0\n---\nCurrent active instructions\n"
     )
     proposed = active.replace("1.0.0", "1.1.0").replace(
-        "Current active instructions", "Approved candidate instructions",
+        "Current active instructions",
+        "Approved candidate instructions",
     )
     (skill_dir / "SKILL.md").write_text(active, encoding="utf-8")
     monkeypatch.setattr(storage, "BASE_DIR", tmp_path)
@@ -89,7 +100,10 @@ def test_cli_skill_approval_uses_temporary_skills_root(
     store = storage.create_storage(Settings(database_path))
     with store.activate():
         proposal_id = store.propose_skill_update(
-            "sample-skill", "agent", "Clarify workflow", proposed,
+            "sample-skill",
+            "agent",
+            "Clarify workflow",
+            proposed,
         )
 
     monkeypatch.setattr(cli.sys, "stdin", SimpleNamespace(isatty=lambda: True))

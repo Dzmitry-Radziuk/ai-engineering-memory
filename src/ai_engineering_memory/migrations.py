@@ -9,7 +9,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-LATEST_SCHEMA_VERSION = 5
+LATEST_SCHEMA_VERSION = 6
 
 _REQUIRED_OBJECTS = {
     "knowledge",
@@ -24,26 +24,60 @@ _REQUIRED_OBJECTS = {
     "idx_knowledge_uuid",
     "idx_knowledge_scope",
     "idx_knowledge_scope_category",
+    "idx_knowledge_namespace_id",
 }
 _REQUIRED_COLUMNS = {
     "knowledge": {
-        "id", "uuid", "category", "title", "content", "status",
-        "source_type", "technology", "confidence", "namespace",
-        "updated_at", "approved_at", "publishable", "content_hash",
+        "id",
+        "uuid",
+        "category",
+        "title",
+        "content",
+        "status",
+        "source_type",
+        "technology",
+        "confidence",
+        "namespace",
+        "updated_at",
+        "approved_at",
+        "publishable",
+        "content_hash",
     },
     "task_events": {
-        "event_id", "project_id", "task_id", "status", "verification_id",
-        "attempt_count", "locked_at", "next_attempt_at", "last_error_type",
-        "analyzed_at", "project_fingerprint",
+        "event_id",
+        "project_id",
+        "task_id",
+        "status",
+        "verification_id",
+        "attempt_count",
+        "locked_at",
+        "next_attempt_at",
+        "last_error_type",
+        "analyzed_at",
+        "project_fingerprint",
     },
     "verification_records": {
-        "verification_id", "project_id", "task_id", "verification_type",
-        "exit_code", "started_at", "completed_at", "artifact_digest",
-        "command_digest", "verifier", "trust_status", "project_fingerprint",
+        "verification_id",
+        "project_id",
+        "task_id",
+        "verification_type",
+        "exit_code",
+        "started_at",
+        "completed_at",
+        "artifact_digest",
+        "command_digest",
+        "verifier",
+        "trust_status",
+        "project_fingerprint",
     },
     "learning_corroborations": {
-        "global_knowledge_id", "project_knowledge_id", "project_namespace",
-        "event_id", "verification_id", "created_at", "project_fingerprint",
+        "global_knowledge_id",
+        "project_knowledge_id",
+        "project_namespace",
+        "event_id",
+        "verification_id",
+        "created_at",
+        "project_fingerprint",
     },
 }
 
@@ -86,35 +120,52 @@ def _migration_1(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )"""
     )
-    _ensure_columns(connection, "knowledge", {
-        "uuid": "TEXT",
-        "source_type": "TEXT NOT NULL DEFAULT 'manual'",
-        "source_reference": "TEXT",
-        "technology": "TEXT NOT NULL DEFAULT ''",
-        "confidence": "REAL NOT NULL DEFAULT 0.5",
-        "namespace": "TEXT NOT NULL DEFAULT 'global'",
-        "updated_at": "TEXT",
-        "approved_at": "TEXT",
-        "publishable": "INTEGER NOT NULL DEFAULT 0",
-        "content_hash": "TEXT",
-    })
+    _ensure_columns(
+        connection,
+        "knowledge",
+        {
+            "uuid": "TEXT",
+            "source_type": "TEXT NOT NULL DEFAULT 'manual'",
+            "source_reference": "TEXT",
+            "technology": "TEXT NOT NULL DEFAULT ''",
+            "confidence": "REAL NOT NULL DEFAULT 0.5",
+            "namespace": "TEXT NOT NULL DEFAULT 'global'",
+            "updated_at": "TEXT",
+            "approved_at": "TEXT",
+            "publishable": "INTEGER NOT NULL DEFAULT 0",
+            "content_hash": "TEXT",
+        },
+    )
     for row in connection.execute("SELECT id FROM knowledge WHERE uuid IS NULL"):
         connection.execute(
-            "UPDATE knowledge SET uuid=? WHERE id=?", (str(uuid.uuid4()), row["id"]),
+            "UPDATE knowledge SET uuid=? WHERE id=?",
+            (str(uuid.uuid4()), row["id"]),
         )
-    connection.execute("UPDATE knowledge SET updated_at=created_at WHERE updated_at IS NULL")
+    connection.execute(
+        "UPDATE knowledge SET updated_at=created_at WHERE updated_at IS NULL"
+    )
     for row in connection.execute(
         "SELECT id,category,title,content FROM knowledge WHERE content_hash IS NULL"
     ):
         digest = hashlib.sha256(
-            (row["category"].lower() + "\0" + row["title"].lower() + "\0"
-             + row["content"].lower()).encode()
+            (
+                row["category"].lower()
+                + "\0"
+                + row["title"].lower()
+                + "\0"
+                + row["content"].lower()
+            ).encode()
         ).hexdigest()
         connection.execute(
-            "UPDATE knowledge SET content_hash=? WHERE id=?", (digest, row["id"]),
+            "UPDATE knowledge SET content_hash=? WHERE id=?",
+            (digest, row["id"]),
         )
-    connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_uuid ON knowledge(uuid)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge(namespace,status)")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_uuid ON knowledge(uuid)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge(namespace,status)"
+    )
     connection.execute(
         """CREATE TABLE IF NOT EXISTS evidence (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,20 +233,26 @@ def _migration_2(connection: sqlite3.Connection) -> None:
 
 
 def _migration_3(connection: sqlite3.Connection) -> None:
-    _ensure_columns(connection, "task_events", {
-        "verification_id": "TEXT",
-        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-        "locked_at": "TEXT",
-        "next_attempt_at": "TEXT",
-        "last_error_type": "TEXT",
-        "analyzed_at": "TEXT",
-    })
+    _ensure_columns(
+        connection,
+        "task_events",
+        {
+            "verification_id": "TEXT",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "locked_at": "TEXT",
+            "next_attempt_at": "TEXT",
+            "last_error_type": "TEXT",
+            "analyzed_at": "TEXT",
+        },
+    )
 
 
 def _migration_4(connection: sqlite3.Connection) -> None:
     _ensure_columns(connection, "task_events", {"project_fingerprint": "TEXT"})
     _ensure_columns(connection, "verification_records", {"project_fingerprint": "TEXT"})
-    _ensure_columns(connection, "learning_corroborations", {"project_fingerprint": "TEXT"})
+    _ensure_columns(
+        connection, "learning_corroborations", {"project_fingerprint": "TEXT"}
+    )
     connection.execute(
         """CREATE UNIQUE INDEX IF NOT EXISTS idx_corroboration_project_fingerprint
         ON learning_corroborations(global_knowledge_id,project_fingerprint)
@@ -211,9 +268,14 @@ def _migration_4(connection: sqlite3.Connection) -> None:
             """INSERT INTO learning_event_audit
             (event_id,action,status_from,status_to,occurred_at,details)
             VALUES(?,?,?,?,?,?)""",
-            (row["event_id"], "legacy_event_requires_verification", row["status"],
-             "waiting_for_verification", applied_at,
-             json.dumps({"reason": "no_trusted_verification_record"})),
+            (
+                row["event_id"],
+                "legacy_event_requires_verification",
+                row["status"],
+                "waiting_for_verification",
+                applied_at,
+                json.dumps({"reason": "no_trusted_verification_record"}),
+            ),
         )
     connection.execute(
         """UPDATE task_events SET status='waiting_for_verification',locked_at=NULL
@@ -229,7 +291,8 @@ def _migration_5(connection: sqlite3.Connection) -> None:
     )
     trigger_names = {"knowledge_ai", "knowledge_ad", "knowledge_au"}
     existing = {
-        row["name"] for row in connection.execute(
+        row["name"]
+        for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE name='knowledge_fts' "
             "OR (type='trigger' AND name IN ('knowledge_ai','knowledge_ad','knowledge_au'))"
         )
@@ -260,10 +323,20 @@ def _migration_5(connection: sqlite3.Connection) -> None:
             VALUES(new.id,new.title,new.content,new.category,new.technology); END"""
         )
         if rebuild:
-            connection.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')")
+            connection.execute(
+                "INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')"
+            )
     except sqlite3.OperationalError as exc:
         if not fts_unavailable(exc):
             raise
+
+
+def _migration_6(connection: sqlite3.Connection) -> None:
+    """Индексирует namespace для ограниченного поиска похожих знаний."""
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_knowledge_namespace_id "
+        "ON knowledge(namespace,id DESC)"
+    )
 
 
 _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
@@ -272,6 +345,7 @@ _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (3, _migration_3),
     (4, _migration_4),
     (5, _migration_5),
+    (6, _migration_6),
 )
 
 
@@ -281,7 +355,8 @@ class MigrationEngine:
     def is_current(self, connection: sqlite3.Connection) -> bool:
         """Checks both recorded version and the columns required by the current code."""
         objects = {
-            row["name"] for row in connection.execute(
+            row["name"]
+            for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
             )
         }

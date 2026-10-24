@@ -25,8 +25,11 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
     foreign_root.mkdir()
     for repository in (project_root, foreign_root):
         subprocess.run(
-            ["git", "init", "--quiet"], cwd=repository, check=True,
-            stdin=subprocess.DEVNULL, capture_output=True,
+            ["git", "init", "--quiet"],
+            cwd=repository,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
         )
     active_namespace = project_namespace(project_root)
     foreign_namespace = project_namespace(foreign_root)
@@ -40,7 +43,8 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
     )
     proposal_seed = subprocess.run(
         [
-            sys.executable, "-c",
+            sys.executable,
+            "-c",
             (
                 "import sys; from ai_engineering_memory import storage; "
                 "print(storage.propose_skill_update('mcp-review-skill','test',"
@@ -48,37 +52,75 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
             ),
             proposal_content,
         ],
-        env=environment, capture_output=True, text=True, check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     skill_proposal_id = proposal_seed.stdout.strip()
     verification = subprocess.run(
         [
-            sys.executable, "-m", "ai_engineering_memory.cli", "learning", "verify",
-            "--task-id", "mcp-verified-candidate", "--summary",
-            "Exercise isolated MCP candidate capture", "--cwd", str(project_root), "--",
-            sys.executable, "-c", "assert 2 + 2 == 4",
+            sys.executable,
+            "-m",
+            "ai_engineering_memory.cli",
+            "learning",
+            "verify",
+            "--task-id",
+            "mcp-verified-candidate",
+            "--summary",
+            "Exercise isolated MCP candidate capture",
+            "--cwd",
+            str(project_root),
+            "--",
+            sys.executable,
+            "-c",
+            "assert 2 + 2 == 4",
         ],
-        env=environment, capture_output=True, text=True, check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     verifier_result = json.loads(verification.stdout)
     foreign_verification = subprocess.run(
         [
-            sys.executable, "-m", "ai_engineering_memory.cli", "learning", "verify",
-            "--task-id", "mcp-foreign-candidate", "--summary",
-            "Exercise foreign MCP candidate rejection", "--cwd", str(foreign_root), "--",
-            sys.executable, "-c", "assert 3 + 3 == 6",
+            sys.executable,
+            "-m",
+            "ai_engineering_memory.cli",
+            "learning",
+            "verify",
+            "--task-id",
+            "mcp-foreign-candidate",
+            "--summary",
+            "Exercise foreign MCP candidate rejection",
+            "--cwd",
+            str(foreign_root),
+            "--",
+            sys.executable,
+            "-c",
+            "assert 3 + 3 == 6",
         ],
-        env=environment, capture_output=True, text=True, check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     foreign_verifier_result = json.loads(foreign_verification.stdout)
     foreign_seed = subprocess.run(
-        [sys.executable, "-c", (
-            "from ai_engineering_memory import storage; "
-            "item=storage.create_knowledge('test','Foreign confidential',"
-            f"'Do not expose this project',namespace='{foreign_namespace}'); "
-            "print(item['id'])"
-        )],
-        env=environment, capture_output=True, text=True, check=True,
+        [
+            sys.executable,
+            "-c",
+            (
+                "from ai_engineering_memory import storage; "
+                "item=storage.create_knowledge('test','Foreign confidential',"
+                f"'Do not expose this project',namespace='{foreign_namespace}'); "
+                "print(item['id'])"
+            ),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     foreign_knowledge_id = int(foreign_seed.stdout.strip())
 
@@ -88,124 +130,211 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
             args=["-m", "ai_engineering_memory.cli", "mcp", "serve"],
             env=environment,
         )
-        async with stdio_client(params) as (read_stream, write_stream), ClientSession(
-            read_stream, write_stream
-        ) as session:
+        async with (
+            stdio_client(params) as (read_stream, write_stream),
+            ClientSession(read_stream, write_stream) as session,
+        ):
             await session.initialize()
             tools = await session.list_tools()
             names = {tool.name for tool in tools.tools}
-            assert not {
-                "memory_approve", "memory_reject", "skills_approve_update",
-                "skills_reject_update", "skills_rollback",
-            } & names
+            assert (
+                not {
+                    "memory_approve",
+                    "memory_reject",
+                    "skills_approve_update",
+                    "skills_reject_update",
+                    "skills_rollback",
+                }
+                & names
+            )
             assert {
-                "memory_search", "memory_overview", "memory_add_candidate", "learning_submit_task",
-                "learning_get_status", "learning_add_candidate",
-                "learning_get_corroboration", "skills_get_proposal",
+                "memory_search",
+                "memory_overview",
+                "memory_add_candidate",
+                "learning_submit_task",
+                "learning_get_status",
+                "learning_add_candidate",
+                "learning_get_corroboration",
+                "skills_get_proposal",
             } <= names
             skill_path = (
                 Path(__file__).resolve().parents[1]
-                / "plugins" / "ai-engineering-memory" / "skills" / "ai-memory" / "SKILL.md"
+                / "plugins"
+                / "ai-engineering-memory"
+                / "skills"
+                / "ai-memory"
+                / "SKILL.md"
             )
             skill_text = skill_path.read_text(encoding="utf-8")
-            skill_tool_references = set(re.findall(
-                r"`((?:memory|learning|skills)_[a-z0-9_]+)`", skill_text,
-            ))
+            skill_tool_references = set(
+                re.findall(
+                    r"`((?:memory|learning|skills)_[a-z0-9_]+)`",
+                    skill_text,
+                )
+            )
             assert skill_tool_references <= names
             assert "learning_capture_verified" not in names
-            proposal_review = await session.call_tool("skills_get_proposal", {
-                "proposal_id": skill_proposal_id,
-            })
+            proposal_review = await session.call_tool(
+                "skills_get_proposal",
+                {
+                    "proposal_id": skill_proposal_id,
+                },
+            )
             assert not proposal_review.is_error
-            assert proposal_review.structured_content["proposed_content"] == proposal_content
+            assert (
+                proposal_review.structured_content["proposed_content"]
+                == proposal_content
+            )
             assert proposal_review.structured_content["current_content"] is None
-            created = await session.call_tool("memory_add_candidate", {
-                "category": "test", "title": "MCP smoke", "content": "isolated tool call",
-                "namespace": "global",
-            })
+            created = await session.call_tool(
+                "memory_add_candidate",
+                {
+                    "category": "test",
+                    "title": "MCP smoke",
+                    "content": "isolated tool call",
+                    "namespace": "global",
+                },
+            )
             assert not created.is_error
             smoke_id = created.structured_content["id"]
-            default_search = await session.call_tool("memory_search", {"query": "MCP smoke"})
+            default_search = await session.call_tool(
+                "memory_search", {"query": "MCP smoke"}
+            )
             assert not default_search.is_error
             assert "MCP smoke" not in str(default_search.content)
-            foreign_search = await session.call_tool("memory_search", {
-                "query": "MCP smoke", "namespace": foreign_namespace,
-                "status": None,
-            })
+            foreign_search = await session.call_tool(
+                "memory_search",
+                {
+                    "query": "MCP smoke",
+                    "namespace": foreign_namespace,
+                    "status": None,
+                },
+            )
             assert foreign_search.is_error
-            foreign_write = await session.call_tool("memory_add_candidate", {
-                "category": "test", "title": "Foreign scope write",
-                "content": "must be denied", "namespace": foreign_namespace,
-            })
+            foreign_write = await session.call_tool(
+                "memory_add_candidate",
+                {
+                    "category": "test",
+                    "title": "Foreign scope write",
+                    "content": "must be denied",
+                    "namespace": foreign_namespace,
+                },
+            )
             assert foreign_write.is_error
-            foreign_list = await session.call_tool("memory_list_candidates", {
-                "namespace": foreign_namespace,
-            })
+            foreign_list = await session.call_tool(
+                "memory_list_candidates",
+                {
+                    "namespace": foreign_namespace,
+                },
+            )
             assert foreign_list.is_error
-            foreign_overview = await session.call_tool("memory_overview", {
-                "namespace": foreign_namespace,
-            })
+            foreign_overview = await session.call_tool(
+                "memory_overview",
+                {
+                    "namespace": foreign_namespace,
+                },
+            )
             assert foreign_overview.is_error
-            foreign_event = await session.call_tool("learning_submit_task", {
-                "event_json": json.dumps({
-                    "event_id": "foreign-project-event",
-                    "project_id": foreign_namespace,
-                    "task_id": "foreign-task",
-                    "client_name": "Codex",
-                    "task_description": "Must not cross the active MCP scope",
-                    "outcome": "Tested",
-                    "completed_at": "2026-10-22T00:00:00Z",
-                    "status": "task_completed",
-                    "test_results": {},
-                }),
-            })
+            foreign_event = await session.call_tool(
+                "learning_submit_task",
+                {
+                    "event_json": json.dumps(
+                        {
+                            "event_id": "foreign-project-event",
+                            "project_id": foreign_namespace,
+                            "task_id": "foreign-task",
+                            "client_name": "Codex",
+                            "task_description": "Must not cross the active MCP scope",
+                            "outcome": "Tested",
+                            "completed_at": "2026-10-22T00:00:00Z",
+                            "status": "task_completed",
+                            "test_results": {},
+                        }
+                    ),
+                },
+            )
             assert foreign_event.is_error
-            prompt_search = await session.call_tool("memory_search", {
-                "query": "Can you find the MCP smoke configuration? " + "details " * 100,
-                "status": "approved", "namespace": "global", "limit": 5,
-                "prompt_context": True,
-            })
+            prompt_search = await session.call_tool(
+                "memory_search",
+                {
+                    "query": "Can you find the MCP smoke configuration? "
+                    + "details " * 100,
+                    "status": "approved",
+                    "namespace": "global",
+                    "limit": 5,
+                    "prompt_context": True,
+                },
+            )
             assert not prompt_search.is_error
             assert "MCP smoke" not in str(prompt_search.content)
-            approved_candidate = await session.call_tool("memory_add_candidate", {
-                "category": "backend", "title": "Retry Support",
-                "content": "MCP hook uses retry support for transient API failures",
-                "namespace": "global",
-            })
+            approved_candidate = await session.call_tool(
+                "memory_add_candidate",
+                {
+                    "category": "backend",
+                    "title": "Retry Support",
+                    "content": "MCP hook uses retry support for transient API failures",
+                    "namespace": "global",
+                },
+            )
             assert not approved_candidate.is_error
             retry_support_id = approved_candidate.structured_content["id"]
             await anyio.run_process(
-                [sys.executable, "-c", (
-                    "from ai_engineering_memory import storage; "
-                    f"storage.approve_knowledge({retry_support_id})"
-                )],
-                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from ai_engineering_memory import storage; "
+                        f"storage.approve_knowledge({retry_support_id})"
+                    ),
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            hidden = await session.call_tool("memory_get", {
-                "knowledge_id": foreign_knowledge_id,
-            })
+            hidden = await session.call_tool(
+                "memory_get",
+                {
+                    "knowledge_id": foreign_knowledge_id,
+                },
+            )
             assert not hidden.is_error
             assert "Foreign confidential" not in str(hidden.content)
             scoped_overview = await session.call_tool("memory_overview", {})
             assert not scoped_overview.is_error
             assert foreign_namespace not in str(scoped_overview.content)
-            prompt_search = await session.call_tool("memory_search", {
-                "query": "Please find Retry Support configuration " + "details " * 100,
-                "status": "approved", "namespace": "global", "limit": 5,
-                "prompt_context": True,
-            })
+            prompt_search = await session.call_tool(
+                "memory_search",
+                {
+                    "query": "Please find Retry Support configuration "
+                    + "details " * 100,
+                    "status": "approved",
+                    "namespace": "global",
+                    "limit": 5,
+                    "prompt_context": True,
+                },
+            )
             assert not prompt_search.is_error
             assert "Retry Support" in str(prompt_search.content)
-            candidate_search = await session.call_tool("memory_search", {
-                "query": "MCP smoke", "status": "candidate", "category": "test",
-                "namespace": "global",
-            })
+            candidate_search = await session.call_tool(
+                "memory_search",
+                {
+                    "query": "MCP smoke",
+                    "status": "candidate",
+                    "category": "test",
+                    "namespace": "global",
+                },
+            )
             assert not candidate_search.is_error
             assert "MCP smoke" in str(candidate_search.content)
-            all_status_search = await session.call_tool("memory_search", {
-                "query": "MCP smoke", "status": None, "category": "test",
-                "namespace": "global",
-            })
+            all_status_search = await session.call_tool(
+                "memory_search",
+                {
+                    "query": "MCP smoke",
+                    "status": None,
+                    "category": "test",
+                    "namespace": "global",
+                },
+            )
             assert not all_status_search.is_error
             assert "MCP smoke" in str(all_status_search.content)
             listed = await session.call_tool("memory_list_candidates", {})
@@ -241,7 +370,10 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
             assert added_result["global_candidate_id"] is None
             repeated = await session.call_tool("learning_add_candidate", lesson)
             assert not repeated.is_error
-            assert repeated.structured_content["knowledge_id"] == added_result["knowledge_id"]
+            assert (
+                repeated.structured_content["knowledge_id"]
+                == added_result["knowledge_id"]
+            )
             assert repeated.structured_content["idempotent"] is True
             foreign_lesson = {
                 **lesson,
@@ -251,17 +383,24 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
                 ],
             }
             rejected_foreign_learning = await session.call_tool(
-                "learning_add_candidate", foreign_lesson,
+                "learning_add_candidate",
+                foreign_lesson,
             )
             assert rejected_foreign_learning.is_error
-            scoped = await session.call_tool("memory_list_candidates", {
-                "namespace": added_result["namespace"],
-            })
+            scoped = await session.call_tool(
+                "memory_list_candidates",
+                {
+                    "namespace": added_result["namespace"],
+                },
+            )
             assert not scoped.is_error
             assert "Keep isolated MCP writes" in str(scoped.content)
-            corroboration = await session.call_tool("learning_get_corroboration", {
-                "knowledge_id": smoke_id,
-            })
+            corroboration = await session.call_tool(
+                "learning_get_corroboration",
+                {
+                    "knowledge_id": smoke_id,
+                },
+            )
             assert not corroboration.is_error
             assert corroboration.structured_content["independent_project_count"] == 0
 
@@ -276,19 +415,28 @@ def test_stdio_server_exposes_tools_and_uses_isolated_database(tmp_path):
                 "status": "task_completed",
                 "test_results": {},
             }
-            submitted = await session.call_tool("learning_submit_task", {
-                "event_json": json.dumps(event),
-            })
+            submitted = await session.call_tool(
+                "learning_submit_task",
+                {
+                    "event_json": json.dumps(event),
+                },
+            )
             assert not submitted.is_error
             assert "waiting_for_verification" in str(submitted.content)
-            task_status = await session.call_tool("learning_get_status", {
-                "event_id": "codex-verified-smoke",
-            })
+            task_status = await session.call_tool(
+                "learning_get_status",
+                {
+                    "event_id": "codex-verified-smoke",
+                },
+            )
             assert not task_status.is_error
             assert "waiting_for_verification" in str(task_status.content)
-            pending_candidates = await session.call_tool("memory_list_candidates", {
-                "limit": 100,
-            })
+            pending_candidates = await session.call_tool(
+                "memory_list_candidates",
+                {
+                    "limit": 100,
+                },
+            )
             assert "MCP smoke" in str(pending_candidates.content)
 
     anyio.run(_exercise)
@@ -301,8 +449,11 @@ def test_verified_mcp_candidate_reaches_hook_only_after_approval(tmp_path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     subprocess.run(
-        ["git", "init", "--quiet"], cwd=project_root, check=True,
-        stdin=subprocess.DEVNULL, capture_output=True,
+        ["git", "init", "--quiet"],
+        cwd=project_root,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
     )
     changed_file = project_root / "src" / "retry.py"
     changed_file.parent.mkdir()
@@ -317,13 +468,28 @@ def test_verified_mcp_candidate_reaches_hook_only_after_approval(tmp_path):
 
     verification = subprocess.run(
         [
-            sys.executable, "-m", "ai_engineering_memory.cli", "learning", "verify",
-            "--task-id", "prompt-retrieval-e2e", "--summary",
-            "Verify bounded retry learning flow", "--cwd", str(project_root),
-            "--changed-file", "src/retry.py", "--",
-            sys.executable, "-c", "assert 'bounded' == 'bounded'",
+            sys.executable,
+            "-m",
+            "ai_engineering_memory.cli",
+            "learning",
+            "verify",
+            "--task-id",
+            "prompt-retrieval-e2e",
+            "--summary",
+            "Verify bounded retry learning flow",
+            "--cwd",
+            str(project_root),
+            "--changed-file",
+            "src/retry.py",
+            "--",
+            sys.executable,
+            "-c",
+            "assert 'bounded' == 'bounded'",
         ],
-        env=environment, capture_output=True, text=True, check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     verifier_result = json.loads(verification.stdout)
     assert verifier_result["process_succeeded"] is True
@@ -335,9 +501,10 @@ def test_verified_mcp_candidate_reaches_hook_only_after_approval(tmp_path):
             args=["-m", "ai_engineering_memory.cli", "mcp", "serve"],
             env=environment,
         )
-        async with stdio_client(params) as (read_stream, write_stream), ClientSession(
-            read_stream, write_stream
-        ) as session:
+        async with (
+            stdio_client(params) as (read_stream, write_stream),
+            ClientSession(read_stream, write_stream) as session,
+        ):
             await session.initialize()
             lesson = {
                 "verification_id": verifier_result["verification_id"],
@@ -364,25 +531,40 @@ def test_verified_mcp_candidate_reaches_hook_only_after_approval(tmp_path):
             assert candidate["namespace"] == project_namespace(project_root)
             assert candidate["verification_id"] == verifier_result["verification_id"]
 
-            unapproved = await session.call_tool("memory_search", {
-                "query": prompt, "status": "approved",
-                "namespace": candidate["namespace"],
-            })
+            unapproved = await session.call_tool(
+                "memory_search",
+                {
+                    "query": prompt,
+                    "status": "approved",
+                    "namespace": candidate["namespace"],
+                },
+            )
             assert not unapproved.is_error
             assert "Use bounded retry backoff" not in str(unapproved.content)
 
             await anyio.run_process(
-                [sys.executable, "-c", (
-                    "from ai_engineering_memory import storage; "
-                    f"storage.approve_knowledge({candidate['knowledge_id']})"
-                )],
-                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from ai_engineering_memory import storage; "
+                        f"storage.approve_knowledge({candidate['knowledge_id']})"
+                    ),
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
+
     anyio.run(_exercise_mcp)
     hook_result = subprocess.run(
         [sys.executable, "-m", "ai_engineering_memory.codex_hooks", "UserPromptSubmit"],
         input=json.dumps({"prompt": prompt, "cwd": str(project_root)}),
-        env=environment, capture_output=True, text=True, encoding="utf-8", check=True,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
     )
     output = json.loads(hook_result.stdout)
     context = output["hookSpecificOutput"]["additionalContext"]

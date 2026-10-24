@@ -37,8 +37,8 @@ def _learning_context() -> str:
         "переносимый урок. Не запускай дополнительную проверку только ради памяти. "
         "Если по запросу или правилам проекта нужна реальная проверка, запусти её один "
         "раз через точную форму `"
-        f"{verifier} --task-id <short-task-id> --summary \"<brief-redacted-summary>\" "
-        "--cwd \"<project-root>\" [--changed-file \"<relative-path>\" ...] -- "
+        f'{verifier} --task-id <short-task-id> --summary "<brief-redacted-summary>" '
+        '--cwd "<project-root>" [--changed-file "<relative-path>" ...] -- '
         "<actual-check-program> <args...>`. Используй Python AEM из команды: голая "
         "команда `ai-memory` может отсутствовать в PATH другого проекта. Передавай "
         "`--changed-file` только для файлов этой задачи. У verifier exit code 0 "
@@ -114,9 +114,16 @@ def _log_path() -> Path:
     return Path.home() / ".ai-engineering-memory" / "hooks.jsonl"
 
 
-def _write_log(event: str, result: str, duration_ms: int, *,
-               count: int = 0, error_type: str | None = None,
-               learning_instruction_injected: bool | None = None) -> None:
+def _write_log(
+    event: str,
+    result: str,
+    duration_ms: int,
+    *,
+    count: int = 0,
+    error_type: str | None = None,
+    learning_instruction_injected: bool | None = None,
+    search_duration_ms: int | None = None,
+) -> None:
     """Добавляет безопасную запись о запуске и ограничивает размер журнала."""
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
@@ -128,6 +135,8 @@ def _write_log(event: str, result: str, duration_ms: int, *,
         "learning_instruction_injected": learning_instruction_injected,
         "error_type": error_type,
     }
+    if search_duration_ms is not None:
+        record["search_duration_ms"] = search_duration_ms
     try:
         path = _log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -145,16 +154,21 @@ def _write_log(event: str, result: str, duration_ms: int, *,
         pass
 
 
-def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
+def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool, int]:
     """Ищет одобренные знания и резервирует контекст для текущего проекта."""
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
-        return {}, 0, False
+        return {}, 0, False, 0
     search_prompt = prompt[:MAX_PROMPT_SEARCH_CHARS]
     memory_service = create_memory_service()
+    search_started = time.perf_counter()
     global_rows = memory_service.search(
-        search_prompt, namespace="global", status="approved", limit=MAX_CONTEXT_MEMORIES,
-        prompt_context=True, read_only=True,
+        search_prompt,
+        namespace="global",
+        status="approved",
+        limit=MAX_CONTEXT_MEMORIES,
+        prompt_context=True,
+        read_only=True,
     )
     project_rows: list[dict[str, Any]] = []
     cwd = payload.get("cwd")
@@ -163,20 +177,24 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
             from ai_engineering_memory.learning import project_namespace
 
             project_rows = memory_service.search(
-                search_prompt, namespace=project_namespace(cwd), status="approved",
-                limit=MAX_CONTEXT_MEMORIES, prompt_context=True,
+                search_prompt,
+                namespace=project_namespace(cwd),
+                status="approved",
+                limit=MAX_CONTEXT_MEMORIES,
+                prompt_context=True,
                 read_only=True,
             )
         except (OSError, RuntimeError, ValueError):
             # Невалидный cwd не должен мешать обработке пользовательского запроса.
             pass
+    search_duration_ms = round((time.perf_counter() - search_started) * 1000)
 
     # Сначала оставляем до трёх локальных записей, затем заполняем остаток общими.
     selected_project = project_rows[:MAX_PROJECT_MEMORIES]
     selected_ids = {row["id"] for row in selected_project}
-    selected_global = [
-        row for row in global_rows if row["id"] not in selected_ids
-    ][:MAX_CONTEXT_MEMORIES - len(selected_project)]
+    selected_global = [row for row in global_rows if row["id"] not in selected_ids][
+        : MAX_CONTEXT_MEMORIES - len(selected_project)
+    ]
     selected_ids.update(row["id"] for row in selected_global)
     for records, destination in (
         (project_rows[MAX_PROJECT_MEMORIES:], selected_project),
@@ -200,8 +218,7 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
             ("global", selected_global),
         )
         for row in records
-        if str(row.get("title", "")).strip()
-        and str(row.get("content", "")).strip()
+        if str(row.get("title", "")).strip() and str(row.get("content", "")).strip()
     ]
     parts = []
     learning_instruction_injected = bool(
@@ -215,9 +232,11 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
         # entry from forging the surrounding delimiters in the prompt context.
         while memory_records:
             serialized = json.dumps(memory_records, ensure_ascii=False)
-            serialized = serialized.replace("&", "\\u0026").replace(
-                ">", "\\u003e"
-            ).replace("<", "\\u003c")
+            serialized = (
+                serialized.replace("&", "\\u0026")
+                .replace(">", "\\u003e")
+                .replace("<", "\\u003c")
+            )
             context = (
                 MEMORY_CONTEXT_NOTICE
                 + "\n<untrusted_engineering_memory_json>\n"
@@ -230,13 +249,18 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
                 break
             memory_records.pop()
     if not parts:
-        return {}, 0, learning_instruction_injected
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "\n\n".join(parts),
-        }
-    }, len(memory_records), learning_instruction_injected
+        return {}, 0, learning_instruction_injected, search_duration_ms
+    return (
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "\n\n".join(parts),
+            }
+        },
+        len(memory_records),
+        learning_instruction_injected,
+        search_duration_ms,
+    )
 
 
 def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -247,6 +271,7 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
     result = "success"
     count = 0
     learning_instruction_injected: bool | None = None
+    search_duration_ms: int | None = None
     error_type = None
     output: dict[str, Any] = {}
     try:
@@ -254,7 +279,12 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
         if supplied_event and supplied_event != event:
             raise ValueError("Hook event does not match payload")
         if event == "UserPromptSubmit":
-            output, count, learning_instruction_injected = _prompt_output(payload)
+            (
+                output,
+                count,
+                learning_instruction_injected,
+                search_duration_ms,
+            ) = _prompt_output(payload)
         else:
             assistant_message = payload.get("last_assistant_message")
             marker_present = (
@@ -269,10 +299,35 @@ def handle_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
     finally:
         duration_ms = round((time.perf_counter() - started) * 1000)
         _write_log(
-            event, result, duration_ms, count=count, error_type=error_type,
+            event,
+            result,
+            duration_ms,
+            count=count,
+            error_type=error_type,
             learning_instruction_injected=learning_instruction_injected,
+            search_duration_ms=search_duration_ms,
         )
     return output
+
+
+def _dispatch_event(event: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Запускает hook с доступом к SQLite только для поиска контекста."""
+    if event == "Stop":
+        return handle_event(event, payload)
+
+    started = time.perf_counter()
+    try:
+        store = storage.create_storage()
+        with store.activate():
+            return handle_event(event, payload)
+    except Exception as exc:  # noqa: BLE001 - hook должен fail-open при ошибке БД.
+        _write_log(
+            event,
+            "error",
+            round((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+        )
+        return {}
 
 
 def _write_json_stdout(value: dict[str, Any]) -> None:
@@ -299,9 +354,7 @@ def main() -> int:
         _write_log(sys.argv[1], "error", 0, error_type="InvalidInput")
         _write_json_stdout({})
         return 0
-    store = storage.create_storage()
-    with store.activate():
-        _write_json_stdout(handle_event(sys.argv[1], payload))
+    _write_json_stdout(_dispatch_event(sys.argv[1], payload))
     return 0
 
 

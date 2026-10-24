@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from ai_engineering_memory.storage import Storage
@@ -36,10 +37,27 @@ class SqliteKnowledgeRepository:
             _read_only=read_only,
         )
 
-    def get(self, knowledge_id: int) -> dict[str, Any] | None:
+    def get(
+        self,
+        knowledge_id: int,
+        *,
+        read_only: bool = False,
+    ) -> dict[str, Any] | None:
         """Возвращает одну запись по стабильному integer ID."""
-        result = self._store.get_knowledge(knowledge_id)
+        result = self._store.get_knowledge(knowledge_id, _read_only=read_only)
         return result if isinstance(result, dict) else None
+
+    def get_by_ids(
+        self,
+        knowledge_ids: Sequence[int],
+        *,
+        read_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Загружает несколько канонических строк одним SQLite соединением."""
+        return self._store.get_knowledge_by_ids(
+            list(knowledge_ids),
+            _read_only=read_only,
+        )
 
     def get_evidence(self, knowledge_id: int) -> list[dict[str, Any]]:
         """Возвращает evidence через совместимый SQLite API."""
@@ -58,7 +76,9 @@ class SqliteKnowledgeRepository:
     ) -> list[dict[str, Any]]:
         """Возвращает записи через совместимый SQLite storage API."""
         return self._store.list_knowledge(
-            status=status, namespace=namespace, limit=limit,
+            status=status,
+            namespace=namespace,
+            limit=limit,
         )
 
     def create_candidate(
@@ -80,11 +100,16 @@ class SqliteKnowledgeRepository:
         )
 
     def list_candidates(
-        self, *, namespace: str, limit: int,
+        self,
+        *,
+        namespace: str,
+        limit: int,
     ) -> list[dict[str, Any]]:
         """Возвращает candidates из одного точного namespace."""
         return self._store.list_knowledge(
-            status="candidate", namespace=namespace, limit=limit,
+            status="candidate",
+            namespace=namespace,
+            limit=limit,
         )
 
     def overview(self, *, namespace: str) -> dict[str, Any]:
@@ -100,7 +125,8 @@ class SqliteLearningRepository:
         self._store = store
 
     def get_event_by_verification(
-        self, verification_id: str,
+        self,
+        verification_id: str,
     ) -> dict[str, Any] | None:
         return self._store.get_learning_event_by_verification(verification_id)
 
@@ -119,20 +145,28 @@ class SqliteLearningRepository:
         return self._store.list_learning_events(limit=limit)
 
     def list_attempts(
-        self, *, limit: int, failed_only: bool,
+        self,
+        *,
+        limit: int,
+        failed_only: bool,
     ) -> list[dict[str, Any]]:
         return self._store.list_verification_attempts(
-            limit=limit, failed_only=failed_only,
+            limit=limit,
+            failed_only=failed_only,
         )
 
     def retry_event(self, event_id: str) -> None:
         self._store.retry_learning_event(event_id)
 
     def withdraw_candidate(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]:
         return self._store.withdraw_learning_candidate(
-            knowledge_id, reason=reason,
+            knowledge_id,
+            reason=reason,
         )
 
 
@@ -150,10 +184,17 @@ class LocalSkillsRepository:
         return self._store.get_skill(name)
 
     def propose_update(
-        self, skill_name: str, proposer: str, description: str, content: str,
+        self,
+        skill_name: str,
+        proposer: str,
+        description: str,
+        content: str,
     ) -> str:
         return self._store.propose_skill_update(
-            skill_name, proposer, description, content,
+            skill_name,
+            proposer,
+            description,
+            content,
         )
 
     def list_proposals(self, status: str) -> list[dict[str, Any]]:
@@ -177,7 +218,10 @@ class LocalAdminRepository:
         return self._store.approve_knowledge(knowledge_id)
 
     def reject_knowledge(
-        self, knowledge_id: int, *, reason: str,
+        self,
+        knowledge_id: int,
+        *,
+        reason: str,
     ) -> dict[str, Any]:
         return self._store.reject_knowledge(knowledge_id, reason=reason)
 
@@ -185,16 +229,29 @@ class LocalAdminRepository:
         return self._store.deprecate_knowledge(knowledge_id)
 
     def decide_skill_proposal(
-        self, proposal_id: str, *, decision: str,
-        maintainer: str, reason: str,
+        self,
+        proposal_id: str,
+        *,
+        decision: str,
+        maintainer: str,
+        reason: str,
     ) -> dict[str, Any]:
         return self._store.decide_skill_proposal(
-            proposal_id, decision=decision, maintainer=maintainer, reason=reason,
+            proposal_id,
+            decision=decision,
+            maintainer=maintainer,
+            reason=reason,
         )
 
     def rollback_skill_version(
-        self, skill_name: str, version: str, *, maintainer: str,
+        self,
+        skill_name: str,
+        version: str,
+        *,
+        maintainer: str,
     ) -> dict[str, Any]:
         return self._store.rollback_skill_version(
-            skill_name, version, maintainer=maintainer,
+            skill_name,
+            version,
+            maintainer=maintainer,
         )

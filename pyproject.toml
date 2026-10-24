@@ -14,6 +14,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "coverage==7.16.2",
+    "mypy==2.4.0",
     "pytest",
     "ruff",
 ]
@@ -26,9 +28,20 @@ packages = ["src/ai_engineering_memory"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py314"
+target-version = "py312"
 extend-exclude = [".tmp", ".pytest-run"]
 
 [tool.pytest.ini_options]
 addopts = "--basetemp=.pytest_tmp"
 testpaths = ["tests"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/ai_engineering_memory"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_unused_configs = true
