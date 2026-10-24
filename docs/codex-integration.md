@@ -20,7 +20,7 @@ cwd = "D:\\Projects\\ai-engineering-memory"
 
 ## Локальный плагин в меню @ приложения ChatGPT/Codex
 
-В проекте есть repo-scoped marketplace `.agents/plugins/marketplace.json` и плагин `plugins/ai-engineering-memory`. Он содержит Skill `ai-memory` и Codex Desktop hook автоматического поиска на каждом пользовательском промпте. Hook вызывает уже подключённый MCP-сервер `ai_engineering_memory`; отдельный сервер или копия базы не создаются.
+В проекте есть repo-scoped marketplace `.agents/plugins/marketplace.json` и плагин `plugins/ai-engineering-memory` со Skill `ai-memory`. В `plugin.json` явно задано `extensions.com.openai.hooks = {}`, поэтому Codex не загружает соседний `hooks/hooks.json` автоматически. Hooks `UserPromptSubmit` и `Stop` отдельно регистрируются в пользовательском профиле командой `ai-memory hooks install`; это единственный штатный способ их активировать и избежать дублирующих обработчиков. Prompt hook использует уже подключённый MCP-сервер `ai_engineering_memory`; отдельный сервер или копия базы не создаются.
 
 ### Установка и вызов
 
