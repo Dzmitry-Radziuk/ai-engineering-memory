@@ -423,6 +423,33 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     f"UserPromptSubmit={hooks['events'].get('UserPromptSubmit', 'нет')} · "
                     f"Stop={hooks['events'].get('Stop', 'нет')}"
                 )
+                observed_events = report["hook_log"].get("events", {})
+                for event in ("UserPromptSubmit", "Stop"):
+                    details = observed_events.get(event)
+                    if not details:
+                        print(f"  Последний запуск {event}: нет записи в журнале")
+                        continue
+                    timestamp = _safe_terminal_text(
+                        details.get("timestamp") or "время неизвестно",
+                    )
+                    result = _safe_terminal_text(
+                        details.get("result") or "результат неизвестен",
+                    )
+                    source = _safe_terminal_text(
+                        details.get("source") or "версия неизвестна",
+                    )
+                    duration = details.get("duration_ms")
+                    duration_label = (
+                        f" · {duration} мс" if isinstance(duration, int) else ""
+                    )
+                    error = details.get("error_type")
+                    error_label = (
+                        f" · ошибка {_safe_terminal_text(error)}" if error else ""
+                    )
+                    print(
+                        f"  Последний запуск {event}: {timestamp} · {result} · "
+                        f"{source}{duration_label}{error_label}"
+                    )
                 unavailable = [
                     event for event, available in hooks.get("launchers", {}).items()
                     if not available
@@ -530,8 +557,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 hook_log = report["hook_log"]
                 print(
                     f"Журнал hooks: {labels[hook_log['status']]} · "
-                    f"ошибок в последних строках: {hook_log['error_count']}"
+                    f"ошибок в просмотренном фрагменте: {hook_log['error_count']}"
                 )
+                latest_error_events = hook_log.get("latest_error_events", [])
+                if latest_error_events:
+                    print(
+                        "  Последний запуск завершился ошибкой для: "
+                        + ", ".join(latest_error_events)
+                    )
                 if hook_log["missing_events"]:
                     print(
                         "  Нет записей для: "

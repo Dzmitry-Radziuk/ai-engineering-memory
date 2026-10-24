@@ -948,13 +948,33 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
         encoding="utf-8",
     )
     hook_log = tmp_path / "hooks.jsonl"
-    hook_log.write_text(json.dumps({
-        "event": "Stop",
-        "timestamp": "2026-10-23T10:01:00+00:00",
-        "source": "ai-engineering-memory:1.5.2",
-        "result": "marker_present_unverified",
-        "duration_ms": 3,
-    }), encoding="utf-8")
+    hook_log.write_text(
+        "\n".join(json.dumps(record) for record in (
+            {
+                "event": "UserPromptSubmit",
+                "timestamp": "2026-10-23T10:00:00+00:00",
+                "source": codex_hooks.HOOK_SOURCE,
+                "result": "error",
+                "duration_ms": 7,
+                "error_type": "RuntimeError",
+            },
+            {
+                "event": "UserPromptSubmit",
+                "timestamp": "2026-10-23T10:00:30+00:00",
+                "source": codex_hooks.HOOK_SOURCE,
+                "result": "success",
+                "duration_ms": 2,
+            },
+            {
+                "event": "Stop",
+                "timestamp": "2026-10-23T10:01:00+00:00",
+                "source": "ai-engineering-memory:1.5.2",
+                "result": "marker_present_unverified",
+                "duration_ms": 3,
+            },
+        )) + "\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr(storage, "DATABASE_PATH", database)
     monkeypatch.setenv("AI_MEMORY_DB", str(database))
@@ -973,6 +993,8 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
         "status_message_matches_expected": False,
     }
     assert report["hook_log"]["events"]["Stop"]["result"] == "marker_present_unverified"
+    assert report["hook_log"]["error_count"] == 1
+    assert report["hook_log"]["latest_error_events"] == []
     assert report["hook_log"]["stale_source_events"] == ["Stop"]
     assert report["database"]["knowledge_counts"] == {
         "total": 1,
@@ -989,6 +1011,16 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
     assert "not_exposed" in output
+    assert (
+        "Последний запуск UserPromptSubmit: 2026-10-23T10:00:30+00:00 · "
+        "success · ai-engineering-memory:1.5.10 · 2 мс"
+    ) in output
+    assert (
+        "Последний запуск Stop: 2026-10-23T10:01:00+00:00 · "
+        "marker_present_unverified · ai-engineering-memory:1.5.2 · 3 мс"
+    ) in output
+    assert "ошибок в просмотренном фрагменте: 1" in output
+    assert "Последний запуск завершился ошибкой" not in output
     assert "последнего наблюдавшегося запуска" in output
     assert "не доказывает, что текущая настройка устарела" in output
     assert "Параметры обработчиков требуют обновления: Stop" in output
