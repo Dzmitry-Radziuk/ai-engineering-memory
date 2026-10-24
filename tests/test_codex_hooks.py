@@ -288,6 +288,20 @@ def test_system_improvement_prompts_get_learning_instructions(isolated_db, tmp_p
         ]
 
 
+def test_common_infrastructure_tasks_get_learning_instructions(isolated_db):
+    """Recognizes infrastructure work phrased with common verbs and tools."""
+    for prompt in (
+        "Fix this Docker deployment",
+        "Update the GitHub Actions workflow",
+        "Add a Docker Compose service",
+        "Configure Kubernetes deployment",
+    ):
+        output = codex_hooks.handle_event("UserPromptSubmit", {"prompt": prompt})
+        assert "learning_add_candidate" in output["hookSpecificOutput"][
+            "additionalContext"
+        ]
+
+
 def test_trivial_non_engineering_prompt_gets_no_learning_instructions(isolated_db):
     """Обычный перевод не получает дополнительный учебный контекст."""
     assert codex_hooks.handle_event(
@@ -299,6 +313,8 @@ def test_general_action_words_need_technical_context_for_learning(isolated_db):
     """Общие глаголы не включают инструкцию обучения без инженерного контекста."""
     for prompt in (
         "Create a birthday invitation",
+        "Create a project plan for a school fundraiser",
+        "Update the fundraiser project schedule",
         "Test me on vocabulary",
         "Создай поздравление с днём рождения",
         "Улучши текст приглашения",
@@ -460,7 +476,7 @@ def test_manifest_and_user_hook_template_are_consistent():
     root = Path(__file__).resolve().parents[1] / "plugins/ai-engineering-memory"
     manifest = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
     hooks = json.loads((root / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
-    assert manifest["version"] == "1.5.11"
+    assert manifest["version"] == "1.5.12"
     assert codex_hooks.HOOK_SOURCE == f"ai-engineering-memory:{manifest['version']}"
     assert manifest["extensions"]["com.openai"]["hooks"] == {}
     assert set(hooks) == {"UserPromptSubmit", "Stop"}
