@@ -461,6 +461,7 @@ def _maintainer_check(
 def _memory_mcp_check(
     mcp_config_path: Path | None,
     project_mcp_config_path: Path | Sequence[Path] | None = None,
+    expected_project_root: Path | None = None,
 ) -> dict[str, Any]:
     """Проверяет регистрацию и форму запуска MCP, не исполняя сервер."""
     result: dict[str, Any] = {
@@ -470,6 +471,7 @@ def _memory_mcp_check(
         "entrypoint_valid": False,
         "runtime_verified": False,
         "project_scope": "not_checked",
+        "project_scope_match": "not_checked",
         "config_scope": "user",
     }
     if mcp_config_path is None and project_mcp_config_path is None:
@@ -526,6 +528,15 @@ def _memory_mcp_check(
             result.update({"status": "invalid_project_root", "project_scope": "invalid"})
             return result
         result["project_scope"] = "configured_root"
+        if expected_project_root is not None:
+            try:
+                expected = expected_project_root.expanduser().resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                result["project_scope_match"] = "expected_root_unavailable"
+            else:
+                result["project_scope_match"] = (
+                    "matched" if project_root == expected else "mismatch"
+                )
 
     command = server.get("command")
     args = server.get("args", [])
@@ -559,7 +570,12 @@ def _memory_mcp_check(
         and normalized_args[:2] == ["mcp", "serve"]
     )
     result["entrypoint_valid"] = module_entrypoint or executable_entrypoint
-    result["status"] = "configured" if result["entrypoint_valid"] else "incomplete"
+    if not result["entrypoint_valid"]:
+        result["status"] = "incomplete"
+    elif result["project_scope_match"] == "mismatch":
+        result["status"] = "project_scope_mismatch"
+    else:
+        result["status"] = "configured"
     return result
 
 
@@ -722,17 +738,33 @@ def collect_diagnostics(
     hook_log_path: Path,
     mcp_config_path: Path | None = None,
     project_mcp_config_path: Path | Sequence[Path] | None = None,
+    expected_project_root: Path | None = None,
     probe_mcp: bool = False,
 ) -> dict[str, Any]:
     """Собирает диагностический отчёт, не меняя базу, конфиг и журнал."""
     database = _database_check(database_path)
     hooks = _hook_config_check(hooks_config_path)
     hook_log = _hook_log_check(hook_log_path)
-    memory_mcp = _memory_mcp_check(mcp_config_path, project_mcp_config_path)
+    memory_mcp = _memory_mcp_check(
+        mcp_config_path, project_mcp_config_path, expected_project_root,
+    )
     if probe_mcp:
-        probe = _probe_memory_mcp(mcp_config_path, project_mcp_config_path)
+        if memory_mcp["status"] == "project_scope_mismatch":
+            probe = {
+                "protocol_probe_status": "skipped_project_scope_mismatch",
+                "protocol_probe_tool_count": None,
+                "protocol_probe_required_tools_present": False,
+                "protocol_probe_call_status": "not_run",
+                "protocol_probe_call_verified": False,
+                "protocol_probe_database_scope": "not_used",
+            }
+        else:
+            probe = _probe_memory_mcp(mcp_config_path, project_mcp_config_path)
         memory_mcp.update(probe)
-        if probe["protocol_probe_status"] not in {"verified", "not_configured"}:
+        if (
+            memory_mcp["status"] != "project_scope_mismatch"
+            and probe["protocol_probe_status"] not in {"verified", "not_configured"}
+        ):
             memory_mcp["status"] = "probe_" + str(probe["protocol_probe_status"])
     maintainer_actions = _maintainer_check(
         mcp_config_path, project_mcp_config_path,
@@ -754,3 +786,4 @@ def collect_diagnostics(
         "memory_mcp": memory_mcp,
         "maintainer_actions": maintainer_actions,
     }
+

@@ -174,12 +174,13 @@ def test_memory_mcp_check_reports_safe_launch_state_without_secrets(tmp_path):
         encoding="utf-8",
     )
 
-    result = diagnostics._memory_mcp_check(config)
+    result = diagnostics._memory_mcp_check(config, expected_project_root=tmp_path)
 
     assert result == {
         "status": "configured", "configured": True,
         "launcher_available": True, "entrypoint_valid": True,
         "runtime_verified": False, "project_scope": "configured_root",
+        "project_scope_match": "matched",
         "config_scope": "user",
     }
     assert "private-database-path" not in json.dumps(result)
@@ -206,6 +207,65 @@ def test_memory_mcp_check_rejects_invalid_project_root_without_echoing_it(tmp_pa
     assert "relative-private-project-path" not in json.dumps(result)
 
 
+def test_memory_mcp_check_detects_configured_root_for_another_project(tmp_path):
+    configured_root = tmp_path / "project-a"
+    expected_root = tmp_path / "project-b"
+    configured_root.mkdir()
+    expected_root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        "[mcp_servers.ai_engineering_memory.env]\n"
+        f"AI_MEMORY_PROJECT_ROOT = {json.dumps(str(configured_root))}\n",
+        encoding="utf-8",
+    )
+
+    result = diagnostics._memory_mcp_check(
+        config, expected_project_root=expected_root,
+    )
+
+    assert result["status"] == "project_scope_mismatch"
+    assert result["project_scope_match"] == "mismatch"
+    assert str(configured_root) not in json.dumps(result)
+    assert str(expected_root) not in json.dumps(result)
+
+
+def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypatch):
+    configured_root = tmp_path / "project-a"
+    expected_root = tmp_path / "project-b"
+    configured_root.mkdir()
+    expected_root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        "[mcp_servers.ai_engineering_memory.env]\n"
+        f"AI_MEMORY_PROJECT_ROOT = {json.dumps(str(configured_root))}\n",
+        encoding="utf-8",
+    )
+    probe_calls = []
+    monkeypatch.setattr(
+        diagnostics, "_probe_memory_mcp",
+        lambda *args, **kwargs: probe_calls.append((args, kwargs)),
+    )
+
+    report = diagnostics.collect_diagnostics(
+        database_path=tmp_path / "missing.db",
+        hooks_config_path=tmp_path / "missing-hooks.json",
+        hook_log_path=tmp_path / "missing-hooks.jsonl",
+        mcp_config_path=config,
+        expected_project_root=expected_root,
+        probe_mcp=True,
+    )
+
+    assert report["memory_mcp"]["status"] == "project_scope_mismatch"
+    assert report["memory_mcp"]["protocol_probe_status"] == "skipped_project_scope_mismatch"
+    assert probe_calls == []
+
+
 def test_memory_mcp_check_merges_project_override_and_inherited_maintainer(tmp_path):
     """Проверяет user+project overlay, не раскрывая конфигурационные значения."""
     project_root = tmp_path / "project"
@@ -227,12 +287,15 @@ def test_memory_mcp_check_merges_project_override_and_inherited_maintainer(tmp_p
         encoding="utf-8",
     )
 
-    result = diagnostics._memory_mcp_check(user_config, project_config)
+    result = diagnostics._memory_mcp_check(
+        user_config, project_config, expected_project_root=project_root,
+    )
     maintainer = diagnostics._maintainer_check(user_config, project_config)
 
     assert result["status"] == "configured"
     assert result["config_scope"] == "project"
     assert result["project_scope"] == "configured_root"
+    assert result["project_scope_match"] == "matched"
     assert result["entrypoint_valid"] is True
     assert maintainer["status"] == "not_exposed"
     assert "user-maintainer-secret" not in json.dumps(result | maintainer)
@@ -846,3 +909,4 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert cli.main(["doctor"]) == 1
     assert "Stop отработал без маркера" in capsys.readouterr().out
     assert database.read_bytes() == before_database
+

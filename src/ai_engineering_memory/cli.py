@@ -360,6 +360,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                 hook_log_path=codex_hooks._log_path(),
                 mcp_config_path=codex_home / "config.toml",
                 project_mcp_config_path=project_mcp_config_paths,
+                expected_project_root=project_root,
                 probe_mcp=args.probe_mcp,
             )
             if args.json:
@@ -444,6 +445,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "unavailable": "launcher не найден",
                     "incomplete": "неполная команда запуска",
                     "invalid_project_root": "корень проекта задан неверно",
+                    "project_scope_mismatch": "MCP закреплён за другим проектом",
                     "invalid": "ошибка формата конфигурации",
                     "error": "ошибка чтения конфигурации",
                 }.get(memory_mcp["status"], "неизвестно")
@@ -495,6 +497,12 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "invalid": "ошибка настройки",
                 }.get(memory_mcp.get("project_scope"), "не проверена")
                 print(f"Область проекта MCP: {project_scope}")
+                if memory_mcp.get("project_scope_match") == "mismatch":
+                    print(
+                        "  AI_MEMORY_PROJECT_ROOT не совпадает с проверяемым проектом; "
+                        "MCP не будет проверяться вызовом инструментов. "
+                        "Используйте отдельную доверенную проектную конфигурацию."
+                    )
                 if memory_mcp.get("project_scope") == "process_cwd":
                     print(
                         "  При смене workspace перезапустите MCP или задайте "
@@ -693,3 +701,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
