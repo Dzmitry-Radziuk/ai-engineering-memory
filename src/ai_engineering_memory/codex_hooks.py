@@ -22,7 +22,7 @@ MAX_PROJECT_MEMORIES = 3
 MAX_PROMPT_SEARCH_CHARS = 10_000
 MAX_LOG_BYTES = 1_000_000
 HOOK_EVENTS = {"UserPromptSubmit", "Stop"}
-HOOK_SOURCE = "ai-engineering-memory:1.5.12"
+HOOK_SOURCE = "ai-engineering-memory:1.5.13"
 
 
 def _learning_context() -> str:
@@ -55,21 +55,26 @@ def _learning_context() -> str:
 
 
 LEARNING_CONTEXT = _learning_context()
-ENGINEERING_PROMPT = re.compile(
-    r"(?i)\b(code|bug|fix|implement|update|add|remove|configure|migrate|optimize|"
-    r"write|debug|refactor|build|create|develop|improve|"
-    r"automate|test|repo|file|function|class|module|integration|architecture|deploy|"
-    r"review|audit|pytest|ruff|retry|"
-    r"database|pipeline|endpoint|sql)\b|"
-    r"(код|ошиб|исправ|реализ|разработ|отлад|рефактор|собер|созда|постро|додел|"
-    r"улучш|автоматиз|самообуч|тест|репоз|файл|"
-    r"функц|класс|модул|интеграц|архитект|депло|проверк|ревью|аудит|повтор|"
-    r"баз[аы]|обработчик|пайплайн|эндпоинт)"
+ENGINEERING_INTENT_PROMPT = re.compile(
+    r"(?i)\b(how should|fix|implement|update|add|remove|configure|migrate|optimize|write|"
+    r"debug|refactor|build|create|develop|improve|automate|test|review|audit|"
+    r"deploy|run|check|change|modify)\b|"
+    r"(\u0438\u0441\u043f\u0440\u0430\u0432|\u0440\u0435\u0430\u043b\u0438\u0437|"
+    r"\u043e\u0431\u043d\u043e\u0432|\u0434\u043e\u0431\u0430\u0432|\u0443\u0434\u0430\u043b|"
+    r"\u043d\u0430\u0441\u0442\u0440\u043e|\u043c\u0438\u0433\u0440|\u043e\u043f\u0442\u0438\u043c|"
+    r"\u043d\u0430\u043f\u0438\u0448|\u043e\u0442\u043b\u0430\u0434|\u0440\u0435\u0444\u0430\u043a\u0442\u043e\u0440|"
+    r"\u0441\u043e\u0431\u0435\u0440|\u0441\u043e\u0437\u0434|\u0440\u0430\u0437\u0440\u0430\u0431\u043e\u0442|"
+    r"\u0443\u043b\u0443\u0447\u0448|\u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0437|"
+    r"\u0442\u0435\u0441\u0442|\u0440\u0435\u0432\u044c\u044e|\u0430\u0443\u0434\u0438\u0442|"
+    r"\u0434\u0435\u043f\u043b\u043e|\u0437\u0430\u043f\u0443\u0441\u043a|\u043f\u0440\u043e\u0432\u0435\u0440|"
+    r"\u0438\u0437\u043c\u0435\u043d|\u0434\u043e\u0434\u0435\u043b|\u0432\u043d\u0435\u0434\u0440|\u043f\u043e\u0447\u0438\u043d)"
 )
 ENGINEERING_CONTEXT_PROMPT = re.compile(
-    r"(?i)\b(code|bug|implement|debug|refactor|repo(?:sitory)?|file|function|class|"
-    r"module|integration|architecture|deploy|docker|compose|container|kubernetes|"
+    r"(?i)\b(code|bug|repo(?:sitory)?|file|function|class|module|integration|"
+    r"architecture|deployment|docker|compose|container|kubernetes|"
     r"k8s|terraform|ansible|nginx|github|gitlab|pytest|ruff|retry|database|pipeline|"
+    r"python|javascript|typescript|java|c\+\+|c#|rust|golang|ruby|php|kotlin|swift|"
+    r"django|flask|fastapi|react|vue|angular|node(?:\.js)?|pull request|pr|"
     r"endpoint|sql|engineering|workflow|software|application|api|service|bot|"
     r"configuration|security|script|mcp|telegram)\b|"
     r"(\u043a\u043e\u0434|\u043e\u0448\u0438\u0431|\u0440\u0435\u0430\u043b\u0438\u0437|"
@@ -200,7 +205,7 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int, bool]:
     ]
     parts = []
     learning_instruction_injected = bool(
-        ENGINEERING_PROMPT.search(prompt)
+        ENGINEERING_INTENT_PROMPT.search(prompt)
         and ENGINEERING_CONTEXT_PROMPT.search(prompt)
     )
     if learning_instruction_injected:
