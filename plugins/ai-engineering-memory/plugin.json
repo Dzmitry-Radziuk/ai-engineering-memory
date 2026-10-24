@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ai-engineering-memory",
+  "version": "1.5.9",
+  "description": "Межпроектное накопление проверенных candidates Codex и безопасное повторное использование утверждённых знаний через MCP.",
+  "extensions": {
+    "com.openai": {
+      "hooks": {},
+      "interface": {
+        "displayName": "AI Engineering Memory",
+        "shortDescription": "Локальная память Codex и кандидаты с явным происхождением.",
+        "longDescription": "Codex получает одобренные знания из текущего проекта и общей памяти. После локального запуска выбранной команды текущая модель может предложить переносимый урок как project candidate; verifier подтверждает только exit code, а не результат задачи. Похожие кандидаты из разных Git origin могут создать global candidate с audit evidence. Обычный поиск использует его только после ручного утверждения; отдельный LLM не нужен, знания и Skills автоматически не утверждаются.",
+        "category": "Productivity"
+      }
+    }
+  }
+}

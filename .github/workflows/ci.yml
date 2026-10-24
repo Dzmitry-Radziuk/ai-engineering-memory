@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install project and development tools
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+      - name: Run Ruff
+        env:
+          AI_MEMORY_DB: ${{ runner.temp }}/ai-engineering-memory-ci.sqlite
+          AI_MEMORY_HOOK_LOG: ${{ runner.temp }}/hooks.jsonl
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: python -m ruff check .
+
+  tests:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install project and development tools
+        run: python -m pip install --disable-pip-version-check -e ".[dev]"
+      - name: Run test suite with an isolated temporary directory
+        env:
+          AI_MEMORY_DB: ${{ runner.temp }}/ai-engineering-memory-ci.sqlite
+          AI_MEMORY_HOOK_LOG: ${{ runner.temp }}/hooks.jsonl
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: python -m pytest -v --basetemp="${{ runner.temp }}/pytest-tmp"

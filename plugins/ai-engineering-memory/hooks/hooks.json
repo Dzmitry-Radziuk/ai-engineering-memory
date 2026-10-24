@@ -1,0 +1,29 @@
+{
+  "description": "Inject up to five approved global and current-project memories and a selective learning instruction before eligible Codex prompts. Stop records metadata only; it does not run or verify checks.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:\\Projects\\ai-engineering-memory\\.venv\\Scripts\\python.exe -m ai_engineering_memory.codex_hooks UserPromptSubmit",
+            "timeout": 5,
+            "statusMessage": "Ищу утверждённые знания в локальной памяти"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:\\Projects\\ai-engineering-memory\\.venv\\Scripts\\python.exe -m ai_engineering_memory.codex_hooks Stop",
+            "timeout": 5,
+            "statusMessage": "Записываю метаданные хода; проверка не запускается"
+          }
+        ]
+      }
+    ]
+  }
+}

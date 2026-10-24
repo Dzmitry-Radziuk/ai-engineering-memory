@@ -1,0 +1,25 @@
+{
+  "name": "ai-engineering-memory-local",
+  "interface": {
+    "displayName": "AI Engineering Memory (local)"
+  },
+  "plugins": [
+    {
+      "name": "ai-engineering-memory",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ai-engineering-memory"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity",
+      "interface": {
+        "displayName": "AI Engineering Memory",
+      "shortDescription": "Локальная память Codex и кандидаты с явным происхождением.",
+      "longDescription": "Codex получает подходящие одобренные знания из общей памяти и текущего проекта. После локального запуска выбранной команды текущий Codex может предложить переносимый урок как project candidate; verifier подтверждает только exit code, а не результат задачи. Похожие кандидаты из разных Git origin могут получить global candidate. Новые знания и изменения Skills требуют ручного решения; Ollama оставлен только для старых ожидающих событий."
+      }
+    }
+  ]
+}

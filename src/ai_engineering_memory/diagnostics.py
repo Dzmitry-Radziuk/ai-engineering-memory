@@ -1,0 +1,725 @@
+"""Диагностика локальной базы и hooks Codex только для чтения."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tomllib
+from collections.abc import Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+from ai_engineering_memory.codex_hooks import HOOK_SOURCE
+from ai_engineering_memory.hook_install import (
+    HOOK_STATUS_MESSAGES,
+    HOOK_TIMEOUT_SECONDS,
+)
+from ai_engineering_memory.storage import LATEST_SCHEMA_VERSION
+
+MAX_LOG_BYTES = 256_000
+MAX_LOG_RECORDS = 500
+_SAFE_ERROR_TYPE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
+_SAFE_HOOK_SOURCE = re.compile(r"^ai-engineering-memory:\d+\.\d+\.\d+$")
+_HOOK_EVENTS = ("UserPromptSubmit", "Stop")
+_COMMAND_HEAD = re.compile(r'^\s*(?:"([^"]+)"|\'([^\']+)\'|(\S+))')
+
+
+def _command_launcher_exists(command: str) -> bool:
+    """Проверяет наличие executable из начала команды, не запуская её."""
+    match = _COMMAND_HEAD.match(command)
+    if not match:
+        return False
+    executable = next((part for part in match.groups() if part), "")
+    if not executable:
+        return False
+    path = Path(executable).expanduser()
+    if path.is_absolute() or "\\" in executable or "/" in executable:
+        return path.is_file()
+    return shutil.which(executable) is not None
+
+
+def _command_matches_current_interpreter(command: str) -> bool:
+    """Сверяет launcher команды с Python текущей диагностики без её запуска."""
+    match = _COMMAND_HEAD.match(command)
+    if not match:
+        return False
+    executable = next((part for part in match.groups() if part), "")
+    if not executable:
+        return False
+    candidate = Path(executable).expanduser()
+    if not candidate.is_absolute() and "\\" not in executable and "/" not in executable:
+        located = shutil.which(executable)
+        if not located:
+            return False
+        candidate = Path(located)
+    try:
+        return os.path.normcase(str(candidate.resolve())) == os.path.normcase(
+            str(Path(sys.executable).resolve())
+        )
+    except OSError:
+        return False
+
+
+def _database_check(path: Path) -> dict[str, Any]:
+    """Проверяет существующую SQLite-базу без её создания или изменения."""
+    result: dict[str, Any] = {
+        "status": "missing",
+        "path": str(path),
+        "integrity": None,
+        "schema_version": None,
+    }
+    if not path.is_file():
+        return result
+
+    wal_path = Path(f"{path}-wal")
+    try:
+        wal_stat = wal_path.stat() if wal_path.exists() else None
+        wal_before = (wal_stat.st_size, wal_stat.st_mtime_ns) if wal_stat else None
+    except OSError as exc:
+        result["status"] = "error"
+        result["error_type"] = type(exc).__name__
+        return result
+    if wal_before and wal_before[0] > 0:
+        result.update({
+            "status": "warning",
+            "integrity": "skipped_active_wal",
+            "recommendation": "SQLite WAL is active; integrity check was skipped to keep this command read-only.",
+        })
+        return result
+
+    try:
+        uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True, timeout=2) as connection:
+            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+            result["integrity"] = str(integrity)
+            has_migrations = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='schema_migrations'"
+            ).fetchone()
+            if has_migrations:
+                version = connection.execute(
+                    "SELECT MAX(version) FROM schema_migrations"
+                ).fetchone()[0]
+                result["schema_version"] = version
+
+        wal_stat = wal_path.stat() if wal_path.exists() else None
+        wal_after = (wal_stat.st_size, wal_stat.st_mtime_ns) if wal_stat else None
+        if wal_before != wal_after:
+            result.update({
+                "status": "warning",
+                "integrity": "snapshot_changed",
+                "recommendation": "SQLite files changed during diagnosis; rerun when no writer is active.",
+            })
+            return result
+
+        if integrity != "ok":
+            result["status"] = "error"
+        elif result["schema_version"] != LATEST_SCHEMA_VERSION:
+            result["status"] = "warning"
+            result["recommendation"] = "Run `ai-memory init` to apply additive migrations."
+        else:
+            result["status"] = "ok"
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        result["status"] = "error"
+        result["error_type"] = type(exc).__name__
+    return result
+
+
+def _hook_config_check(path: Path) -> dict[str, Any]:
+    """Проверяет наличие команд обоих hooks в Codex-конфиге."""
+    result: dict[str, Any] = {
+        "status": "missing",
+        "path": str(path),
+        "events": {},
+        "registration_counts": {},
+        "launchers": {},
+        "launcher_matches_current_interpreter": {},
+        "handler_metadata": {},
+        "metadata_mismatch_events": [],
+    }
+    if not path.is_file():
+        return result
+
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        result["status"] = "error"
+        result["error_type"] = type(exc).__name__
+        return result
+
+    hooks = document.get("hooks") if isinstance(document, dict) else None
+    for event in _HOOK_EVENTS:
+        definitions = hooks.get(event, []) if isinstance(hooks, dict) else []
+        handlers = []
+        if isinstance(definitions, list):
+            for definition in definitions:
+                definition_handlers = (
+                    definition.get("hooks", []) if isinstance(definition, dict) else []
+                )
+                if isinstance(definition_handlers, list):
+                    handlers.extend(
+                        handler for handler in definition_handlers
+                        if isinstance(handler, dict)
+                        and handler.get("type") == "command"
+                        and isinstance(handler.get("command"), str)
+                    )
+        expected = f"-m ai_engineering_memory.codex_hooks {event}"
+        matching_handlers = [
+            handler for handler in handlers if expected in handler["command"]
+        ]
+        matching_commands = [handler["command"] for handler in matching_handlers]
+        result["registration_counts"][event] = len(matching_commands)
+        result["events"][event] = (
+            "missing" if not matching_commands
+            else "duplicate" if len(matching_commands) > 1
+            else "ok"
+        )
+        result["launchers"][event] = (
+            any(_command_launcher_exists(command) for command in matching_commands)
+            if matching_commands else False
+        )
+        result["launcher_matches_current_interpreter"][event] = (
+            any(
+                _command_matches_current_interpreter(command)
+                for command in matching_commands
+            )
+            if matching_commands else False
+        )
+        timeout_matches = bool(matching_handlers) and all(
+            type(handler.get("timeout")) is int
+            and handler["timeout"] == HOOK_TIMEOUT_SECONDS
+            for handler in matching_handlers
+        )
+        status_matches = bool(matching_handlers) and all(
+            handler.get("statusMessage") == HOOK_STATUS_MESSAGES[event]
+            for handler in matching_handlers
+        )
+        result["handler_metadata"][event] = {
+            "timeout_matches_expected": timeout_matches,
+            "status_message_matches_expected": status_matches,
+        }
+        if not timeout_matches or not status_matches:
+            result["metadata_mismatch_events"].append(event)
+
+    result["status"] = (
+        "ok"
+        if all(value == "ok" for value in result["events"].values())
+        and all(result["launchers"].values())
+        and not result["metadata_mismatch_events"]
+        else "warning"
+    )
+    return result
+
+
+def _hook_log_check(path: Path) -> dict[str, Any]:
+    """Читает ограниченный хвост журнала и оставляет только безопасную метаинформацию."""
+    result: dict[str, Any] = {
+        "status": "missing",
+        "events": {},
+        "missing_events": list(_HOOK_EVENTS),
+        "expected_source": HOOK_SOURCE,
+        "stale_source_events": [],
+        "error_count": 0,
+        "invalid_line_count": 0,
+    }
+    if not path.is_file():
+        return result
+
+    try:
+        with path.open("rb") as stream:
+            offset = max(0, path.stat().st_size - MAX_LOG_BYTES)
+            stream.seek(offset)
+            if offset:
+                stream.readline()
+            tail = stream.read(MAX_LOG_BYTES).decode("utf-8", errors="replace")
+    except OSError as exc:
+        result["status"] = "error"
+        result["error_type"] = type(exc).__name__
+        return result
+
+    records = []
+    lines = tail.splitlines()
+    if len(lines) > MAX_LOG_RECORDS:
+        lines = lines[-MAX_LOG_RECORDS:]
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            result["invalid_line_count"] += 1
+            continue
+        if not isinstance(record, dict) or record.get("event") not in _HOOK_EVENTS:
+            result["invalid_line_count"] += 1
+            continue
+        records.append(record)
+
+    for record in records:
+        event = record["event"]
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str) and len(timestamp) <= 64:
+            try:
+                datetime.fromisoformat(timestamp)
+            except ValueError:
+                timestamp = None
+        else:
+            timestamp = None
+        duration_ms = record.get("duration_ms")
+        if not isinstance(duration_ms, int) or not 0 <= duration_ms <= 86_400_000:
+            duration_ms = None
+        source = record.get("source")
+        safe_source = (
+            source
+            if isinstance(source, str) and _SAFE_HOOK_SOURCE.fullmatch(source)
+            else None
+        )
+        result["events"][event] = {
+            "timestamp": timestamp,
+            "source": safe_source,
+            "result": record.get("result") if record.get("result") in {
+                "success", "captured", "verification_required", "no_verified_marker", "error",
+                "marker_present_unverified", "no_marker_seen",
+            } else None,
+            "duration_ms": duration_ms,
+            "error_type": (
+                record.get("error_type")
+                if isinstance(record.get("error_type"), str)
+                and _SAFE_ERROR_TYPE.fullmatch(record["error_type"])
+                else None
+            ),
+        }
+        if record.get("result") == "error":
+            result["error_count"] += 1
+
+    result["missing_events"] = [
+        event for event in _HOOK_EVENTS if event not in result["events"]
+    ]
+    latest_error_events = [
+        event for event, details in result["events"].items()
+        if details["result"] == "error"
+    ]
+    result["latest_error_events"] = latest_error_events
+    result["stale_source_events"] = [
+        event for event, details in result["events"].items()
+        if details["source"] is not None and details["source"] != HOOK_SOURCE
+    ]
+    has_unrecognized_result = any(
+        details["result"] is None for details in result["events"].values()
+    )
+    has_unrecognized_source = any(
+        record.get("source") is not None
+        and not (
+            isinstance(record.get("source"), str)
+            and _SAFE_HOOK_SOURCE.fullmatch(record["source"])
+        )
+        for record in records
+    )
+    result["status"] = (
+        "ok"
+        if records
+        and not result["missing_events"]
+        and not result["invalid_line_count"]
+        and not latest_error_events
+        and not result["stale_source_events"]
+        and not has_unrecognized_result
+        and not has_unrecognized_source
+        else "warning"
+    )
+    return result
+
+
+def _effective_mcp_config(
+    mcp_config_path: Path | None,
+    project_mcp_config_path: Path | Sequence[Path] | None = None,
+) -> tuple[dict[str, Any] | None, str | None, str]:
+    """Объединяет user и project MCP-слои без изменения файлов."""
+    effective: dict[str, Any] = {}
+    loaded = False
+    project_has_server = False
+    project_paths = (
+        (project_mcp_config_path,)
+        if isinstance(project_mcp_config_path, Path)
+        else tuple(project_mcp_config_path or ())
+    )
+    config_layers = []
+    if mcp_config_path is not None:
+        config_layers.append((mcp_config_path, False))
+    config_layers.extend((path, True) for path in project_paths)
+    for path, project_scoped in config_layers:
+        if path is None:
+            continue
+        try:
+            layer = tomllib.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+            return None, type(exc).__name__, "project" if project_scoped else "user"
+        loaded = True
+        if not isinstance(layer, dict):
+            return None, "InvalidConfig", "project" if project_scoped else "user"
+
+        base_servers = effective.get("mcp_servers", {})
+        layer_servers = layer.get("mcp_servers", {})
+        if isinstance(base_servers, dict) and isinstance(layer_servers, dict):
+            merged_servers = dict(base_servers)
+            for server_name, layer_server in layer_servers.items():
+                base_server = merged_servers.get(server_name)
+                if isinstance(base_server, dict) and isinstance(layer_server, dict):
+                    merged_server = {**base_server, **layer_server}
+                    base_env = base_server.get("env", {})
+                    layer_env = layer_server.get("env", {})
+                    if isinstance(base_env, dict) and isinstance(layer_env, dict):
+                        merged_server["env"] = {**base_env, **layer_env}
+                    merged_servers[server_name] = merged_server
+                else:
+                    merged_servers[server_name] = layer_server
+                if project_scoped and server_name == "ai_engineering_memory":
+                    project_has_server = True
+            effective.update(layer)
+            effective["mcp_servers"] = merged_servers
+        else:
+            effective.update(layer)
+            if project_scoped and "mcp_servers" in layer:
+                project_has_server = True
+
+    if not loaded:
+        return None, None, "user"
+    return effective, None, "project" if project_has_server else "user"
+
+
+def _maintainer_check(
+    mcp_config_path: Path | None = None,
+    project_mcp_config_path: Path | Sequence[Path] | None = None,
+) -> dict[str, str]:
+    """Сверяет настройку с окружением MCP и не раскрывает значение maintainer."""
+    config, error_type, _ = _effective_mcp_config(
+        mcp_config_path, project_mcp_config_path,
+    )
+    if error_type:
+        return {
+            "status": "unknown",
+            "source": "mcp_config",
+            "message": "Maintainer configuration could not be read",
+            "error_type": error_type,
+        }
+    if config is not None:
+        servers = config.get("mcp_servers", {})
+        server = servers.get("ai_engineering_memory") if isinstance(servers, dict) else None
+        if server is not None and not isinstance(server, dict):
+            return {
+                "status": "unknown",
+                "source": "mcp_config",
+                "message": "MCP server configuration has an invalid format",
+            }
+        server_env = server.get("env", {}) if isinstance(server, dict) else {}
+        if not isinstance(server_env, dict):
+            return {
+                "status": "unknown",
+                "source": "mcp_config",
+                "message": "MCP server environment has an invalid format",
+            }
+        if "AI_MEMORY_MAINTAINER" in server_env:
+            value = server_env["AI_MEMORY_MAINTAINER"]
+            if not isinstance(value, str):
+                return {
+                    "status": "unknown",
+                    "source": "mcp_config",
+                    "message": "Maintainer setting must be a string",
+                }
+            configured = bool(value.strip())
+            return {
+                "status": "configured" if configured else "not_configured",
+                "source": "mcp_config",
+                "message": "Maintainer actions enabled" if configured
+                else "Maintainer actions disabled in MCP config",
+            }
+
+    inherited = bool(os.environ.get("AI_MEMORY_MAINTAINER", "").strip())
+    return {
+        "status": "inherited" if inherited else "not_configured",
+        "source": "doctor_process_environment" if inherited else "unset",
+        "message": "Maintainer value exists only in the doctor process environment; "
+        "MCP inheritance is not verified" if inherited
+        else "Maintainer actions disabled: AI_MEMORY_MAINTAINER is not set in MCP config",
+    }
+
+
+def _memory_mcp_check(
+    mcp_config_path: Path | None,
+    project_mcp_config_path: Path | Sequence[Path] | None = None,
+) -> dict[str, Any]:
+    """Проверяет регистрацию и форму запуска MCP, не исполняя сервер."""
+    result: dict[str, Any] = {
+        "status": "not_checked",
+        "configured": False,
+        "launcher_available": False,
+        "entrypoint_valid": False,
+        "runtime_verified": False,
+        "project_scope": "not_checked",
+        "config_scope": "user",
+    }
+    if mcp_config_path is None and project_mcp_config_path is None:
+        return result
+    config, error_type, config_scope = _effective_mcp_config(
+        mcp_config_path, project_mcp_config_path,
+    )
+    result["config_scope"] = config_scope
+    if error_type:
+        result.update({"status": "error", "error_type": error_type})
+        return result
+    if config is None:
+        result["status"] = "missing"
+        return result
+
+    servers = config.get("mcp_servers") if isinstance(config, dict) else None
+    if not isinstance(servers, dict):
+        result["status"] = "missing"
+        return result
+    server = servers.get("ai_engineering_memory")
+    if server is None:
+        result["status"] = "missing"
+        return result
+    if not isinstance(server, dict):
+        result["status"] = "invalid"
+        return result
+    if server.get("enabled") is False:
+        result["status"] = "disabled"
+        return result
+
+    server_env = server.get("env", {})
+    if not isinstance(server_env, dict):
+        result["status"] = "invalid"
+        return result
+    configured_root = server_env.get("AI_MEMORY_PROJECT_ROOT")
+    if configured_root is None:
+        result["project_scope"] = "process_cwd"
+    elif not isinstance(configured_root, str):
+        result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+        return result
+    elif not configured_root.strip():
+        result["project_scope"] = "process_cwd"
+    else:
+        project_root = Path(configured_root.strip()).expanduser()
+        if not project_root.is_absolute():
+            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            return result
+        try:
+            project_root = project_root.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            return result
+        if not project_root.is_dir():
+            result.update({"status": "invalid_project_root", "project_scope": "invalid"})
+            return result
+        result["project_scope"] = "configured_root"
+
+    command = server.get("command")
+    args = server.get("args", [])
+    if (
+        not isinstance(command, str) or not command.strip()
+        or not isinstance(args, list)
+        or any(not isinstance(argument, str) for argument in args)
+    ):
+        result["status"] = "invalid"
+        return result
+
+    executable = Path(command).expanduser()
+    if executable.is_absolute() or "\\" in command or "/" in command:
+        launcher_available = executable.is_file()
+    else:
+        launcher_available = shutil.which(command) is not None
+    result["configured"] = True
+    result["launcher_available"] = launcher_available
+    if not launcher_available:
+        result["status"] = "unavailable"
+        return result
+
+    normalized_args = [argument.casefold() for argument in args]
+    module_entrypoint = any(
+        normalized_args[index:index + 4]
+        == ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
+        for index in range(max(0, len(normalized_args) - 3))
+    )
+    executable_entrypoint = (
+        executable.stem.casefold() in {"ai-memory", "ai-memory.exe"}
+        and normalized_args[:2] == ["mcp", "serve"]
+    )
+    result["entrypoint_valid"] = module_entrypoint or executable_entrypoint
+    result["status"] = "configured" if result["entrypoint_valid"] else "incomplete"
+    return result
+
+
+def _probe_memory_mcp(
+    mcp_config_path: Path | None,
+    project_mcp_config_path: Path | Sequence[Path] | None = None,
+    *,
+    timeout_seconds: float = 5,
+) -> dict[str, Any]:
+    """Проверяет MCP initialize и tools/list без вызова инструментов сервера."""
+    result: dict[str, Any] = {
+        "protocol_probe_status": "not_requested",
+        "protocol_probe_tool_count": None,
+        "protocol_probe_required_tools_present": False,
+    }
+    try:
+        config, error_type, _ = _effective_mcp_config(
+            mcp_config_path, project_mcp_config_path,
+        )
+        if error_type:
+            result["protocol_probe_status"] = "config_error"
+            result["protocol_probe_error_type"] = error_type
+            return result
+        if config is None:
+            result["protocol_probe_status"] = "missing_config"
+            return result
+        servers = config.get("mcp_servers")
+        if not isinstance(servers, dict):
+            result["protocol_probe_status"] = "not_configured"
+            return result
+        server = servers.get("ai_engineering_memory")
+        if not isinstance(server, dict):
+            result["protocol_probe_status"] = "not_configured"
+            return result
+        if server.get("enabled") is False:
+            result["protocol_probe_status"] = "disabled"
+            return result
+        command = server.get("command")
+        args = server.get("args", [])
+        server_env = server.get("env", {})
+        if (
+            not isinstance(command, str) or not command.strip()
+            or not isinstance(args, list)
+            or any(not isinstance(arg, str) for arg in args)
+            or not isinstance(server_env, dict)
+            or any(not isinstance(key, str) or not isinstance(value, str)
+                   for key, value in server_env.items())
+        ):
+            result["protocol_probe_status"] = "invalid_config"
+            return result
+        allowed_environment_keys = {"PLUGIN_DATA", "LOCALAPPDATA"}
+        unsupported_environment = [
+            key for key in server_env
+            if key not in allowed_environment_keys and not key.startswith("AI_MEMORY_")
+        ]
+        if unsupported_environment:
+            result["protocol_probe_status"] = "unsupported_environment_skipped"
+            return result
+
+        executable = Path(command).expanduser()
+        if not executable.is_absolute() and "\\" not in command and "/" not in command:
+            resolved = shutil.which(command)
+            if resolved is None:
+                result["protocol_probe_status"] = "launcher_unavailable"
+                return result
+            executable = Path(resolved)
+        stem = executable.stem.casefold()
+        normalized_args = [arg.casefold() for arg in args]
+        safe_python_entrypoint = (
+            stem in {"python", "python3", "python.exe", "python3.exe"}
+            and normalized_args == ["-m", "ai_engineering_memory.cli", "mcp", "serve"]
+        )
+        safe_script_entrypoint = (
+            stem in {"ai-memory", "ai-memory.exe"}
+            and normalized_args == ["mcp", "serve"]
+        )
+        if not (safe_python_entrypoint or safe_script_entrypoint):
+            result["protocol_probe_status"] = "unsafe_command_skipped"
+            return result
+
+        environment = os.environ.copy()
+        environment.update(server_env)
+        cwd = server.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            result["protocol_probe_status"] = "invalid_config"
+            return result
+        params = StdioServerParameters(
+            command=command,
+            args=args,
+            env=environment,
+            cwd=cwd or None,
+        )
+
+        async def _handshake() -> tuple[int, bool]:
+            async with (
+                stdio_client(params) as (read_stream, write_stream),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+                listed = await session.list_tools()
+                names = {tool.name for tool in listed.tools}
+                required = {"memory_search", "learning_add_candidate"}
+                return len(names), required <= names
+
+        try:
+            tool_count, required_tools_present = asyncio.run(
+                asyncio.wait_for(_handshake(), timeout=timeout_seconds)
+            )
+        except TimeoutError:
+            result["protocol_probe_status"] = "timeout"
+            return result
+        except Exception as exc:  # noqa: BLE001 - only a safe type is exposed.
+            result["protocol_probe_status"] = "error"
+            result["protocol_probe_error_type"] = type(exc).__name__
+            return result
+
+        result.update({
+            "protocol_probe_status": "verified" if required_tools_present else "incompatible_server",
+            "protocol_probe_tool_count": tool_count,
+            "protocol_probe_required_tools_present": required_tools_present,
+        })
+        if required_tools_present:
+            result["status"] = "configured"
+        return result
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        result["protocol_probe_status"] = "config_error"
+        result["protocol_probe_error_type"] = type(exc).__name__
+        return result
+
+
+def collect_diagnostics(
+    *,
+    database_path: Path,
+    hooks_config_path: Path,
+    hook_log_path: Path,
+    mcp_config_path: Path | None = None,
+    project_mcp_config_path: Path | Sequence[Path] | None = None,
+    probe_mcp: bool = False,
+) -> dict[str, Any]:
+    """Собирает диагностический отчёт, не меняя базу, конфиг и журнал."""
+    database = _database_check(database_path)
+    hooks = _hook_config_check(hooks_config_path)
+    hook_log = _hook_log_check(hook_log_path)
+    memory_mcp = _memory_mcp_check(mcp_config_path, project_mcp_config_path)
+    if probe_mcp:
+        probe = _probe_memory_mcp(mcp_config_path, project_mcp_config_path)
+        memory_mcp.update(probe)
+        if probe["protocol_probe_status"] not in {"verified", "not_configured"}:
+            memory_mcp["status"] = "probe_" + str(probe["protocol_probe_status"])
+    maintainer_actions = _maintainer_check(
+        mcp_config_path, project_mcp_config_path,
+    )
+    checks = (database, hooks, hook_log)
+    overall = "error" if any(check["status"] == "error" for check in checks) or (
+        memory_mcp["status"] == "error"
+    ) else (
+        "warning"
+        if any(check["status"] != "ok" for check in checks)
+        or memory_mcp["status"] != "configured"
+        or maintainer_actions["status"] != "configured"
+        else "ok"
+    )
+    return {
+        "overall": overall,
+        "database": database,
+        "hooks": hooks,
+        "hook_log": hook_log,
+        "memory_mcp": memory_mcp,
+        "maintainer_actions": maintainer_actions,
+    }
