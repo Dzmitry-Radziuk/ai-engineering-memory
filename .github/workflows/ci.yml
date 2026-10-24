@@ -19,10 +19,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.12", "3.13", "3.14"]
-    env:
-      AI_MEMORY_DB: ${{ runner.temp }}/ai-engineering-memory-ci.sqlite
-      AI_MEMORY_HOOK_LOG: ${{ runner.temp }}/hooks.jsonl
-      CODEX_HOME: ${{ runner.temp }}/codex-home
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -35,6 +31,10 @@ jobs:
       - name: Run Ruff
         run: python -m ruff check .
       - name: Run tests
+        env:
+          AI_MEMORY_DB: ${{ runner.temp }}/ai-engineering-memory-ci.sqlite
+          AI_MEMORY_HOOK_LOG: ${{ runner.temp }}/hooks.jsonl
+          CODEX_HOME: ${{ runner.temp }}/codex-home
         run: python -m pytest -v --basetemp="${{ runner.temp }}/pytest"
 
   package:
