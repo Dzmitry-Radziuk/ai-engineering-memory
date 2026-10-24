@@ -211,7 +211,9 @@ def test_memory_mcp_check_detects_configured_root_for_another_project(tmp_path):
     configured_root = tmp_path / "project-a"
     expected_root = tmp_path / "project-b"
     configured_root.mkdir()
+    (configured_root / ".git").mkdir()
     expected_root.mkdir()
+    (expected_root / ".git").mkdir()
     config = tmp_path / "config.toml"
     config.write_text(
         "[mcp_servers.ai_engineering_memory]\n"
@@ -236,7 +238,9 @@ def test_memory_mcp_check_detects_explicit_cwd_for_another_project(tmp_path):
     configured_cwd = tmp_path / "project-a"
     expected_root = tmp_path / "project-b"
     configured_cwd.mkdir()
+    (configured_cwd / ".git").mkdir()
     expected_root.mkdir()
+    (expected_root / ".git").mkdir()
     config = tmp_path / "config.toml"
     config.write_text(
         "[mcp_servers.ai_engineering_memory]\n"
@@ -305,7 +309,9 @@ def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypa
     configured_root = tmp_path / "project-a"
     expected_root = tmp_path / "project-b"
     configured_root.mkdir()
+    (configured_root / ".git").mkdir()
     expected_root.mkdir()
+    (expected_root / ".git").mkdir()
     config = tmp_path / "config.toml"
     config.write_text(
         "[mcp_servers.ai_engineering_memory]\n"
