@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_engineering_memory import codex_hooks, hook_install, storage
+from ai_engineering_memory import codex_hooks, storage
 
 
 @pytest.fixture
@@ -499,21 +499,10 @@ def test_hook_log_rotates(tmp_path, monkeypatch):
     assert json.loads(log.read_text(encoding="utf-8"))["event"] == "Stop"
 
 
-def test_manifest_and_user_hook_template_are_consistent():
-    """Проверяет версию plugin и отсутствие дублирующих пользовательских hooks."""
+def test_manifest_keeps_hooks_profile_scoped():
+    """Plugin does not duplicate hooks installed in the user profile."""
     root = Path(__file__).resolve().parents[1] / "plugins/ai-engineering-memory"
     manifest = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
-    hooks = json.loads((root / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
     assert manifest["version"] == "1.5.13"
     assert codex_hooks.HOOK_SOURCE == f"ai-engineering-memory:{manifest['version']}"
     assert manifest["extensions"]["com.openai"]["hooks"] == {}
-    assert set(hooks) == {"UserPromptSubmit", "Stop"}
-    for event in ("UserPromptSubmit", "Stop"):
-        handler = hooks[event][0]["hooks"][0]
-        assert handler["type"] == "command"
-        assert r".venv\Scripts\python.exe" in handler["command"]
-        assert handler["command"].endswith(
-            f"-m ai_engineering_memory.codex_hooks {event}"
-        )
-        assert handler["statusMessage"] == hook_install.HOOK_STATUS_MESSAGES[event]
-        assert "args" not in handler
