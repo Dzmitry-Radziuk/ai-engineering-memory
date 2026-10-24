@@ -171,7 +171,11 @@ def _parser() -> argparse.ArgumentParser:
     proposals.add_argument("--status", default="candidate")
     learning = commands.add_parser("learning")
     learning_commands = learning.add_subparsers(dest="action", required=True)
-    learning_commands.add_parser("status")
+    learning_status = learning_commands.add_parser("status")
+    learning_status.add_argument(
+        "--human", action="store_true",
+        help="показать короткую сводку вместо JSON",
+    )
     queue = learning_commands.add_parser("list")
     queue.add_argument("--limit", type=int, default=100)
     attempts = learning_commands.add_parser(
@@ -661,7 +665,36 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     summary["llm_provider"] = "not configured"
                     summary["automatic_analysis"] = False
                     summary["legacy_manual_analysis_available"] = False
-                print(json.dumps(summary, ensure_ascii=False, indent=2))
+                if args.human:
+                    statuses = summary.get("status_counts", {})
+                    status_summary = ", ".join(
+                        f"{_safe_terminal_text(status)}={count}"
+                        for status, count in sorted(statuses.items())
+                    ) or "нет"
+                    attempts = summary.get("verification_attempts", {})
+                    print(
+                        f"Обучение: событий {summary.get('total', 0)} "
+                        f"({status_summary}); проверок {attempts.get('total', 0)}, "
+                        f"ошибок {attempts.get('failed', 0)}, "
+                        f"ошибок запуска {attempts.get('launch_failures', 0)}."
+                    )
+                    print(
+                        "Сбор через Codex: best-effort; нужны UserPromptSubmit, "
+                        "модель Codex и MCP-инструмент learning_add_candidate."
+                    )
+                    provider = summary.get("provider_type")
+                    if provider:
+                        print(
+                            "Дополнительный анализ: доступен только вручную "
+                            "через learning process; автоматический запуск выключен."
+                        )
+                    else:
+                        print(
+                            "Дополнительный анализ: провайдер не настроен; "
+                            "это не отключает сбор через Codex."
+                        )
+                else:
+                    print(json.dumps(summary, ensure_ascii=False, indent=2))
             elif args.action == "list":
                 print(json.dumps(learning_service.list_events(limit=args.limit),
                                  ensure_ascii=False, indent=2))

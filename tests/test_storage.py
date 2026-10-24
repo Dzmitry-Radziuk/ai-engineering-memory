@@ -590,6 +590,25 @@ def test_learning_status_reports_ollama_as_manual_only(isolated_db, monkeypatch,
     assert result["automatic_analysis"] is False
     assert result["background_analysis_configured"] is False
     assert result["legacy_manual_analysis_available"] is True
+    assert cli.main(["learning", "status", "--human"]) == 0
+    human_output = capsys.readouterr().out
+    assert "Дополнительный анализ: доступен только вручную" in human_output
+    assert "автоматический запуск выключен" in human_output
+
+
+def test_learning_status_human_explains_codex_capture_without_provider(
+    isolated_db, capsys,
+):
+    """Поясняет best-effort capture, не смешивая его с legacy-провайдером."""
+    from ai_engineering_memory import cli
+
+    assert cli.main(["learning", "status", "--human"]) == 0
+    output = capsys.readouterr().out
+
+    assert "Обучение: событий 0 (нет); проверок 0, ошибок 0, ошибок запуска 0." in output
+    assert "Сбор через Codex: best-effort" in output
+    assert "провайдер не настроен; это не отключает сбор через Codex" in output
+    assert "automatic_analysis" not in output
 
 
 def test_export_rejects_unapproved_and_path_traversal(isolated_db, monkeypatch, tmp_path):

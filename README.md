@@ -58,6 +58,7 @@ Dry-run перечисляет изменяемые события и назва
 
 ```powershell
 .venv\Scripts\ai-memory.exe learning verify --task-id task-123 --summary "Harden retry handling" --cwd D:\Projects\sample --changed-file src\retry.py -- python -m pytest -q
+.venv\Scripts\ai-memory.exe learning status --human
 .venv\Scripts\ai-memory.exe learning status
 .venv\Scripts\ai-memory.exe learning list
 .venv\Scripts\ai-memory.exe learning attempts
@@ -65,6 +66,7 @@ Dry-run перечисляет изменяемые события и назва
 
 `learning attempts` показывает последние неудачные запуски проверок без сырых команд и вывода; добавьте `--all`, чтобы включить успешные.
 `learning status` дополнительно показывает общий счётчик проверок, число неудачных запусков и число ошибок запуска команды отдельно от очереди анализа.
+Для короткой понятной сводки используйте `learning status --human`; без `--human` команда по-прежнему выводит JSON для скриптов.
 
 Verifier сохраняет только переданные пути, которые `git status` считает изменёнными, staged или новыми; clean-файлы и пути вне Git не становятся `file:`-evidence. Принятые пути видны в поле `recorded_changed_files`.
 
