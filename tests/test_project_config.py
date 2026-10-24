@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -15,6 +16,10 @@ def test_project_config_prints_valid_scoped_mcp_settings_without_writes(
     """Печатает валидный MCP-блок для проекта и не создаёт в нём файлы."""
     project_root = tmp_path / "sample project"
     project_root.mkdir()
+    subprocess.run(
+        ["git", "init", "--quiet", str(project_root)],
+        check=True, capture_output=True, text=True,
+    )
     database_path = tmp_path / "must-not-be-created.sqlite"
     monkeypatch.setattr(storage, "DATABASE_PATH", database_path)
     monkeypatch.setenv("AI_MEMORY_DB", str(database_path))
