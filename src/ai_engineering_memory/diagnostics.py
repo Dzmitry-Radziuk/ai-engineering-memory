@@ -458,6 +458,16 @@ def _maintainer_check(
 
 
 
+def _same_project_namespace(first: Path, second: Path) -> bool | None:
+    """Сравнивает пути по тем же Git-границам, что и MCP namespace."""
+    try:
+        from ai_engineering_memory.learning import project_namespace
+
+        return project_namespace(first) == project_namespace(second)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
 def _memory_mcp_check(
     mcp_config_path: Path | None,
     project_mcp_config_path: Path | Sequence[Path] | None = None,
@@ -507,13 +517,42 @@ def _memory_mcp_check(
         result["status"] = "invalid"
         return result
     configured_root = server_env.get("AI_MEMORY_PROJECT_ROOT")
+    if isinstance(configured_root, str) and not configured_root.strip():
+        configured_root = None
     if configured_root is None:
-        result["project_scope"] = "process_cwd"
+        configured_cwd = server.get("cwd")
+        if configured_cwd is None:
+            result["project_scope"] = "process_cwd"
+        elif not isinstance(configured_cwd, str) or not configured_cwd.strip():
+            result.update({"status": "invalid_project_cwd", "project_scope": "invalid"})
+            return result
+        else:
+            project_cwd = Path(configured_cwd.strip()).expanduser()
+            result["project_scope"] = "configured_cwd"
+            if not project_cwd.is_absolute():
+                result["project_scope_match"] = "unverified"
+            else:
+                try:
+                    project_cwd = project_cwd.resolve(strict=True)
+                except (OSError, RuntimeError, ValueError):
+                    result.update({"status": "invalid_project_cwd", "project_scope": "invalid"})
+                    return result
+                if not project_cwd.is_dir():
+                    result.update({"status": "invalid_project_cwd", "project_scope": "invalid"})
+                    return result
+                if expected_project_root is not None:
+                    matches_expected = _same_project_namespace(
+                        project_cwd, expected_project_root,
+                    )
+                    if matches_expected is None:
+                        result["project_scope_match"] = "unverified"
+                    else:
+                        result["project_scope_match"] = (
+                            "matched" if matches_expected else "mismatch"
+                        )
     elif not isinstance(configured_root, str):
         result.update({"status": "invalid_project_root", "project_scope": "invalid"})
         return result
-    elif not configured_root.strip():
-        result["project_scope"] = "process_cwd"
     else:
         project_root = Path(configured_root.strip()).expanduser()
         if not project_root.is_absolute():
@@ -529,13 +568,14 @@ def _memory_mcp_check(
             return result
         result["project_scope"] = "configured_root"
         if expected_project_root is not None:
-            try:
-                expected = expected_project_root.expanduser().resolve(strict=True)
-            except (OSError, RuntimeError, ValueError):
+            matches_expected = _same_project_namespace(
+                project_root, expected_project_root,
+            )
+            if matches_expected is None:
                 result["project_scope_match"] = "expected_root_unavailable"
             else:
                 result["project_scope_match"] = (
-                    "matched" if project_root == expected else "mismatch"
+                    "matched" if matches_expected else "mismatch"
                 )
 
     command = server.get("command")
@@ -574,6 +614,8 @@ def _memory_mcp_check(
         result["status"] = "incomplete"
     elif result["project_scope_match"] == "mismatch":
         result["status"] = "project_scope_mismatch"
+    elif result["project_scope_match"] == "unverified":
+        result["status"] = "project_scope_unverified"
     else:
         result["status"] = "configured"
     return result
@@ -749,9 +791,15 @@ def collect_diagnostics(
         mcp_config_path, project_mcp_config_path, expected_project_root,
     )
     if probe_mcp:
-        if memory_mcp["status"] == "project_scope_mismatch":
+        if memory_mcp["status"] in {
+            "project_scope_mismatch", "project_scope_unverified",
+        }:
             probe = {
-                "protocol_probe_status": "skipped_project_scope_mismatch",
+                "protocol_probe_status": (
+                    "skipped_project_scope_mismatch"
+                    if memory_mcp["status"] == "project_scope_mismatch"
+                    else "skipped_project_scope_unverified"
+                ),
                 "protocol_probe_tool_count": None,
                 "protocol_probe_required_tools_present": False,
                 "protocol_probe_call_status": "not_run",
@@ -762,7 +810,9 @@ def collect_diagnostics(
             probe = _probe_memory_mcp(mcp_config_path, project_mcp_config_path)
         memory_mcp.update(probe)
         if (
-            memory_mcp["status"] != "project_scope_mismatch"
+            memory_mcp["status"] not in {
+                "project_scope_mismatch", "project_scope_unverified",
+            }
             and probe["protocol_probe_status"] not in {"verified", "not_configured"}
         ):
             memory_mcp["status"] = "probe_" + str(probe["protocol_probe_status"])
@@ -786,4 +836,3 @@ def collect_diagnostics(
         "memory_mcp": memory_mcp,
         "maintainer_actions": maintainer_actions,
     }
-

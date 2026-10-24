@@ -445,7 +445,9 @@ def _main(argv: Sequence[str] | None = None) -> int:
                     "unavailable": "launcher не найден",
                     "incomplete": "неполная команда запуска",
                     "invalid_project_root": "корень проекта задан неверно",
+                    "invalid_project_cwd": "рабочий каталог MCP задан неверно",
                     "project_scope_mismatch": "MCP закреплён за другим проектом",
+                    "project_scope_unverified": "область MCP не удалось сверить с проектом",
                     "invalid": "ошибка формата конфигурации",
                     "error": "ошибка чтения конфигурации",
                 }.get(memory_mcp["status"], "неизвестно")
@@ -485,6 +487,8 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         "config_error": "не удалось прочитать конфигурацию",
                         "not_configured": "сервер не зарегистрирован",
                         "missing_config": "файл конфигурации не найден",
+                        "skipped_project_scope_mismatch": "корень MCP относится к другому проекту; процесс не запускался",
+                        "skipped_project_scope_unverified": "рабочую область MCP нельзя надёжно сверить; процесс не запускался",
                     }
                     probe_status = memory_mcp.get("protocol_probe_status", "unknown")
                     probe_message = probe_messages.get(probe_status, "причина не определена")
@@ -493,6 +497,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         print(f"  Тип ошибки: {memory_mcp['protocol_probe_error_type']}")
                 project_scope = {
                     "configured_root": "закреплённый AI_MEMORY_PROJECT_ROOT",
+                    "configured_cwd": "рабочий каталог MCP из конфигурации",
                     "process_cwd": "рабочий каталог процесса MCP",
                     "invalid": "ошибка настройки",
                 }.get(memory_mcp.get("project_scope"), "не проверена")
@@ -502,6 +507,11 @@ def _main(argv: Sequence[str] | None = None) -> int:
                         "  AI_MEMORY_PROJECT_ROOT не совпадает с проверяемым проектом; "
                         "MCP не будет проверяться вызовом инструментов. "
                         "Используйте отдельную доверенную проектную конфигурацию."
+                    )
+                elif memory_mcp.get("project_scope_match") == "unverified":
+                    print(
+                        "  Рабочую область MCP нельзя надёжно сверить с проектом; "
+                        "используйте абсолютный AI_MEMORY_PROJECT_ROOT."
                     )
                 if memory_mcp.get("project_scope") == "process_cwd":
                     print(
@@ -701,4 +711,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -232,6 +232,75 @@ def test_memory_mcp_check_detects_configured_root_for_another_project(tmp_path):
     assert str(expected_root) not in json.dumps(result)
 
 
+def test_memory_mcp_check_detects_explicit_cwd_for_another_project(tmp_path):
+    configured_cwd = tmp_path / "project-a"
+    expected_root = tmp_path / "project-b"
+    configured_cwd.mkdir()
+    expected_root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        f"cwd = {json.dumps(str(configured_cwd))}\n",
+        encoding="utf-8",
+    )
+
+    result = diagnostics._memory_mcp_check(
+        config, expected_project_root=expected_root,
+    )
+
+    assert result["status"] == "project_scope_mismatch"
+    assert result["project_scope"] == "configured_cwd"
+    assert result["project_scope_match"] == "mismatch"
+    assert str(configured_cwd) not in json.dumps(result)
+    assert str(expected_root) not in json.dumps(result)
+
+
+def test_memory_mcp_check_matches_cwd_subdirectory_to_git_project_root(tmp_path):
+    project_root = tmp_path / "project"
+    configured_cwd = project_root / "src"
+    (project_root / ".git").mkdir(parents=True)
+    configured_cwd.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        f"cwd = {json.dumps(str(configured_cwd))}\n",
+        encoding="utf-8",
+    )
+
+    result = diagnostics._memory_mcp_check(
+        config, expected_project_root=project_root,
+    )
+
+    assert result["status"] == "configured"
+    assert result["project_scope"] == "configured_cwd"
+    assert result["project_scope_match"] == "matched"
+
+
+def test_memory_mcp_check_marks_relative_cwd_unverified(tmp_path):
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        'cwd = "relative-project-path"\n',
+        encoding="utf-8",
+    )
+
+    result = diagnostics._memory_mcp_check(
+        config, expected_project_root=project_root,
+    )
+
+    assert result["status"] == "project_scope_unverified"
+    assert result["project_scope_match"] == "unverified"
+    assert "relative-project-path" not in json.dumps(result)
+
+
 def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypatch):
     configured_root = tmp_path / "project-a"
     expected_root = tmp_path / "project-b"
@@ -263,6 +332,37 @@ def test_doctor_skips_mcp_probe_when_project_scope_mismatches(tmp_path, monkeypa
 
     assert report["memory_mcp"]["status"] == "project_scope_mismatch"
     assert report["memory_mcp"]["protocol_probe_status"] == "skipped_project_scope_mismatch"
+    assert probe_calls == []
+
+
+def test_doctor_skips_mcp_probe_when_project_scope_is_unverified(tmp_path, monkeypatch):
+    expected_root = tmp_path / "project"
+    expected_root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[mcp_servers.ai_engineering_memory]\n"
+        f"command = {json.dumps(sys.executable)}\n"
+        'args = ["-m", "ai_engineering_memory.cli", "mcp", "serve"]\n'
+        'cwd = "relative-project-path"\n',
+        encoding="utf-8",
+    )
+    probe_calls = []
+    monkeypatch.setattr(
+        diagnostics, "_probe_memory_mcp",
+        lambda *args, **kwargs: probe_calls.append((args, kwargs)),
+    )
+
+    report = diagnostics.collect_diagnostics(
+        database_path=tmp_path / "missing.db",
+        hooks_config_path=tmp_path / "missing-hooks.json",
+        hook_log_path=tmp_path / "missing-hooks.jsonl",
+        mcp_config_path=config,
+        expected_project_root=expected_root,
+        probe_mcp=True,
+    )
+
+    assert report["memory_mcp"]["status"] == "project_scope_unverified"
+    assert report["memory_mcp"]["protocol_probe_status"] == "skipped_project_scope_unverified"
     assert probe_calls == []
 
 
@@ -909,4 +1009,3 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert cli.main(["doctor"]) == 1
     assert "Stop отработал без маркера" in capsys.readouterr().out
     assert database.read_bytes() == before_database
-
