@@ -253,6 +253,21 @@ def test_engineering_prompt_gets_model_native_learning_instructions(isolated_db,
     assert "Fix the retry bug" not in context
 
 
+def test_hook_log_records_only_whether_learning_instruction_was_added(
+    isolated_db, tmp_path,
+):
+    """Records the classifier result without storing prompt or instruction text."""
+    codex_hooks.handle_event(
+        "UserPromptSubmit", {"prompt": "Fix the retry bug and run pytest"}
+    )
+
+    log_text = (tmp_path / "hooks.jsonl").read_text(encoding="utf-8")
+    record = json.loads(log_text)
+    assert record["learning_instruction_injected"] is True
+    assert "Fix the retry bug" not in log_text
+    assert codex_hooks.LEARNING_CONTEXT not in log_text
+
+
 def test_system_improvement_prompts_get_learning_instructions(isolated_db, tmp_path):
     """Запросы о развитии системы и автоматизации также запускают обучение."""
     prompts = (
@@ -440,7 +455,7 @@ def test_manifest_and_user_hook_template_are_consistent():
     root = Path(__file__).resolve().parents[1] / "plugins/ai-engineering-memory"
     manifest = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
     hooks = json.loads((root / "hooks/hooks.json").read_text(encoding="utf-8"))["hooks"]
-    assert manifest["version"] == "1.5.10"
+    assert manifest["version"] == "1.5.11"
     assert codex_hooks.HOOK_SOURCE == f"ai-engineering-memory:{manifest['version']}"
     assert manifest["extensions"]["com.openai"]["hooks"] == {}
     assert set(hooks) == {"UserPromptSubmit", "Stop"}
