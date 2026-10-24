@@ -1,4 +1,4 @@
-"""Адаптер командных lifecycle hooks Codex к локальному ядру памяти."""
+""Адаптер командных lifecycle hooks Codex к локальному ядру памяти."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_engineering_memory import storage
+from ai_engineering_memory.bootstrap import create_memory_service
 
 MAX_INPUT_BYTES = 8_000_000
 MAX_CONTEXT_CHARS = 6_000
@@ -136,9 +137,10 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     if not isinstance(prompt, str) or not prompt.strip():
         return {}, 0
     search_prompt = prompt[:MAX_PROMPT_SEARCH_CHARS]
-    global_rows = storage.search_knowledge(
+    memory_service = create_memory_service()
+    global_rows = memory_service.search(
         search_prompt, namespace="global", status="approved", limit=MAX_CONTEXT_MEMORIES,
-        prompt_context=True, _read_only=True,
+        prompt_context=True, read_only=True,
     )
     project_rows: list[dict[str, Any]] = []
     cwd = payload.get("cwd")
@@ -146,10 +148,10 @@ def _prompt_output(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         try:
             from ai_engineering_memory.learning import project_namespace
 
-            project_rows = storage.search_knowledge(
+            project_rows = memory_service.search(
                 search_prompt, namespace=project_namespace(cwd), status="approved",
                 limit=MAX_CONTEXT_MEMORIES, prompt_context=True,
-                _read_only=True,
+                read_only=True,
             )
         except (OSError, RuntimeError, ValueError):
             # Невалидный cwd не должен мешать обработке пользовательского запроса.
@@ -275,7 +277,9 @@ def main() -> int:
         _write_log(sys.argv[1], "error", 0, error_type="InvalidInput")
         _write_json_stdout({})
         return 0
-    _write_json_stdout(handle_event(sys.argv[1], payload))
+    store = storage.create_storage()
+    with store.activate():
+        _write_json_stdout(handle_event(sys.argv[1], payload))
     return 0
 
 

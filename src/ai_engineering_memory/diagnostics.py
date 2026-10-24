@@ -1,4 +1,4 @@
-"""Диагностика локальной базы и hooks Codex только для чтения."""
+""Диагностика локальной базы и hooks Codex только для чтения."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import tomllib
 from collections.abc import Sequence
 from datetime import datetime
@@ -398,57 +399,14 @@ def _maintainer_check(
     mcp_config_path: Path | None = None,
     project_mcp_config_path: Path | Sequence[Path] | None = None,
 ) -> dict[str, str]:
-    """Сверяет настройку с окружением MCP и не раскрывает значение maintainer."""
-    config, error_type, _ = _effective_mcp_config(
-        mcp_config_path, project_mcp_config_path,
-    )
-    if error_type:
-        return {
-            "status": "unknown",
-            "source": "mcp_config",
-            "message": "Maintainer configuration could not be read",
-            "error_type": error_type,
-        }
-    if config is not None:
-        servers = config.get("mcp_servers", {})
-        server = servers.get("ai_engineering_memory") if isinstance(servers, dict) else None
-        if server is not None and not isinstance(server, dict):
-            return {
-                "status": "unknown",
-                "source": "mcp_config",
-                "message": "MCP server configuration has an invalid format",
-            }
-        server_env = server.get("env", {}) if isinstance(server, dict) else {}
-        if not isinstance(server_env, dict):
-            return {
-                "status": "unknown",
-                "source": "mcp_config",
-                "message": "MCP server environment has an invalid format",
-            }
-        if "AI_MEMORY_MAINTAINER" in server_env:
-            value = server_env["AI_MEMORY_MAINTAINER"]
-            if not isinstance(value, str):
-                return {
-                    "status": "unknown",
-                    "source": "mcp_config",
-                    "message": "Maintainer setting must be a string",
-                }
-            configured = bool(value.strip())
-            return {
-                "status": "configured" if configured else "not_configured",
-                "source": "mcp_config",
-                "message": "Maintainer actions enabled" if configured
-                else "Maintainer actions disabled in MCP config",
-            }
-
-    inherited = bool(os.environ.get("AI_MEMORY_MAINTAINER", "").strip())
+    """Сообщает, что привилегированные операции не опубликованы как MCP-инструменты."""
     return {
-        "status": "inherited" if inherited else "not_configured",
-        "source": "doctor_process_environment" if inherited else "unset",
-        "message": "Maintainer value exists only in the doctor process environment; "
-        "MCP inheritance is not verified" if inherited
-        else "Maintainer actions disabled: AI_MEMORY_MAINTAINER is not set in MCP config",
+        "status": "not_exposed",
+        "source": "mcp_tool_surface",
+        "message": "Privileged knowledge and Skill mutations are not registered as MCP tools",
     }
+
+
 
 
 def _memory_mcp_check(
@@ -562,11 +520,14 @@ def _probe_memory_mcp(
     *,
     timeout_seconds: float = 5,
 ) -> dict[str, Any]:
-    """Проверяет MCP initialize и tools/list без вызова инструментов сервера."""
+    """Проверяет MCP и вызывает только memory_search на временной пустой базе."""
     result: dict[str, Any] = {
         "protocol_probe_status": "not_requested",
         "protocol_probe_tool_count": None,
         "protocol_probe_required_tools_present": False,
+        "protocol_probe_call_status": "not_requested",
+        "protocol_probe_call_verified": False,
+        "protocol_probe_database_scope": "not_used",
     }
     try:
         config, error_type, _ = _effective_mcp_config(
@@ -639,41 +600,63 @@ def _probe_memory_mcp(
         if cwd is not None and not isinstance(cwd, str):
             result["protocol_probe_status"] = "invalid_config"
             return result
-        params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=environment,
-            cwd=cwd or None,
-        )
-
-        async def _handshake() -> tuple[int, bool]:
-            async with (
-                stdio_client(params) as (read_stream, write_stream),
-                ClientSession(read_stream, write_stream) as session,
-            ):
-                await session.initialize()
-                listed = await session.list_tools()
-                names = {tool.name for tool in listed.tools}
-                required = {"memory_search", "learning_add_candidate"}
-                return len(names), required <= names
-
-        try:
-            tool_count, required_tools_present = asyncio.run(
-                asyncio.wait_for(_handshake(), timeout=timeout_seconds)
+        with tempfile.TemporaryDirectory(prefix="ai-memory-doctor-") as probe_dir:
+            environment["AI_MEMORY_DB"] = str(Path(probe_dir) / "probe.sqlite")
+            result["protocol_probe_database_scope"] = "isolated_temporary"
+            params = StdioServerParameters(
+                command=command,
+                args=args,
+                env=environment,
+                cwd=cwd or None,
             )
-        except TimeoutError:
-            result["protocol_probe_status"] = "timeout"
-            return result
-        except Exception as exc:  # noqa: BLE001 - only a safe type is exposed.
-            result["protocol_probe_status"] = "error"
-            result["protocol_probe_error_type"] = type(exc).__name__
-            return result
+
+            async def _handshake_and_smoke() -> tuple[int, bool, bool]:
+                async with (
+                    stdio_client(params) as (read_stream, write_stream),
+                    ClientSession(read_stream, write_stream) as session,
+                ):
+                    await session.initialize()
+                    listed = await session.list_tools()
+                    names = {tool.name for tool in listed.tools}
+                    required = {"memory_search", "learning_add_candidate"}
+                    required_present = required <= names
+                    if not required_present:
+                        return len(names), False, False
+                    called = await session.call_tool(
+                        "memory_search",
+                        {"query": "ai-memory-doctor-smoke", "namespace": "global", "limit": 1},
+                    )
+                    return len(names), True, not called.is_error
+
+            try:
+                tool_count, required_tools_present, call_verified = asyncio.run(
+                    asyncio.wait_for(
+                        _handshake_and_smoke(), timeout=timeout_seconds,
+                    )
+                )
+            except TimeoutError:
+                result["protocol_probe_status"] = "timeout"
+                result["protocol_probe_call_status"] = "timeout"
+                return result
+            except Exception as exc:  # noqa: BLE001 - only a safe type is exposed.
+                result["protocol_probe_status"] = "error"
+                result["protocol_probe_error_type"] = type(exc).__name__
+                result["protocol_probe_call_status"] = "error"
+                return result
 
         result.update({
-            "protocol_probe_status": "verified" if required_tools_present else "incompatible_server",
+            "protocol_probe_status": (
+                "verified" if required_tools_present else "incompatible_server"
+            ),
             "protocol_probe_tool_count": tool_count,
             "protocol_probe_required_tools_present": required_tools_present,
+            "protocol_probe_call_status": (
+                "verified" if call_verified else "tool_error" if required_tools_present else "not_available"
+            ),
+            "protocol_probe_call_verified": call_verified,
         })
+        if required_tools_present and not call_verified:
+            result["protocol_probe_status"] = "tool_call_error"
         if required_tools_present:
             result["status"] = "configured"
         return result
@@ -712,7 +695,6 @@ def collect_diagnostics(
         "warning"
         if any(check["status"] != "ok" for check in checks)
         or memory_mcp["status"] != "configured"
-        or maintainer_actions["status"] != "configured"
         else "ok"
     )
     return {

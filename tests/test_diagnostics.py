@@ -1,4 +1,4 @@
-"""Проверки read-only диагностики локальной установки."""
+""Проверки read-only диагностики локальной установки."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def test_diagnostics_checks_database_hooks_and_redacted_log(tmp_path):
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (4)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
     before_database = database.read_bytes()
 
     hook_config = tmp_path / "hooks.json"
@@ -67,7 +67,7 @@ def test_diagnostics_checks_database_hooks_and_redacted_log(tmp_path):
     serialized = json.dumps(report)
     assert report["overall"] == "warning"
     assert report["database"]["integrity"] == "ok"
-    assert report["database"]["schema_version"] == 4
+    assert report["database"]["schema_version"] == 5
     assert report["hooks"]["events"] == {
         "UserPromptSubmit": "ok", "Stop": "ok",
     }
@@ -184,7 +184,7 @@ def test_memory_mcp_check_merges_project_override_and_inherited_maintainer(tmp_p
     assert result["config_scope"] == "project"
     assert result["project_scope"] == "configured_root"
     assert result["entrypoint_valid"] is True
-    assert maintainer["status"] == "configured"
+    assert maintainer["status"] == "not_exposed"
     assert "user-maintainer-secret" not in json.dumps(result | maintainer)
 
 
@@ -216,7 +216,7 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (4)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
     _write_hook_config(codex_home / "hooks.json")
@@ -251,6 +251,7 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     )
 
     monkeypatch.setattr(storage, "DATABASE_PATH", database)
+    monkeypatch.setenv("AI_MEMORY_DB", str(database))
     monkeypatch.setattr(codex_hooks, "_log_path", lambda: hook_log)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("CODEX_HOME", raising=False)
@@ -263,7 +264,7 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     assert report["memory_mcp"]["config_scope"] == "project"
     assert report["memory_mcp"]["project_scope"] == "configured_root"
     assert report["memory_mcp"]["runtime_verified"] is False
-    assert report["maintainer_actions"]["status"] == "configured"
+    assert report["maintainer_actions"]["status"] == "not_exposed"
 
     assert cli.main(["doctor", "--cwd", str(project_root)]) == 0
     human_report = capsys.readouterr().out
@@ -284,7 +285,7 @@ def test_doctor_cli_reads_project_overlay_for_requested_cwd(
     assert nested_report["memory_mcp"]["config_scope"] == "project"
 
 
-def test_doctor_mcp_probe_lists_tools_without_calling_them_or_creating_database(tmp_path):
+def test_doctor_mcp_probe_calls_read_only_tool_on_isolated_database(tmp_path):
     config = tmp_path / "config.toml"
     database = tmp_path / "probe.sqlite"
     config.write_text(
@@ -302,6 +303,9 @@ def test_doctor_mcp_probe_lists_tools_without_calling_them_or_creating_database(
     assert result["protocol_probe_status"] == "verified"
     assert result["protocol_probe_required_tools_present"] is True
     assert result["protocol_probe_tool_count"] > 0
+    assert result["protocol_probe_call_status"] == "verified"
+    assert result["protocol_probe_call_verified"] is True
+    assert result["protocol_probe_database_scope"] == "isolated_temporary"
     report = diagnostics.collect_diagnostics(
         database_path=tmp_path / "doctor.sqlite",
         hooks_config_path=tmp_path / "hooks.json",
@@ -370,12 +374,12 @@ def test_maintainer_diagnostic_reports_only_configuration_state(tmp_path, monkey
     """Сообщает, включены ли решения владельца, не раскрывая его имя."""
     monkeypatch.delenv("AI_MEMORY_MAINTAINER", raising=False)
     disabled = diagnostics._maintainer_check()
-    assert disabled["status"] == "not_configured"
+    assert disabled["status"] == "not_exposed"
 
     monkeypatch.setenv("AI_MEMORY_MAINTAINER", "private-maintainer-name")
     enabled = diagnostics._maintainer_check()
-    assert enabled["status"] == "inherited"
-    assert enabled["source"] == "doctor_process_environment"
+    assert enabled["status"] == "not_exposed"
+    assert enabled["source"] == "mcp_tool_surface"
     assert "private-maintainer-name" not in json.dumps(enabled)
 
     mcp_config = tmp_path / "config.toml"
@@ -386,8 +390,8 @@ def test_maintainer_diagnostic_reports_only_configuration_state(tmp_path, monkey
     )
     monkeypatch.setenv("AI_MEMORY_MAINTAINER", "inherited-but-not-used")
     configured = diagnostics._maintainer_check(mcp_config)
-    assert configured["status"] == "configured"
-    assert configured["source"] == "mcp_config"
+    assert configured["status"] == "not_exposed"
+    assert configured["source"] == "mcp_tool_surface"
     assert "private-maintainer-name" not in json.dumps(configured)
     assert "inherited-but-not-used" not in json.dumps(configured)
 
@@ -396,16 +400,16 @@ def test_maintainer_diagnostic_reports_only_configuration_state(tmp_path, monkey
         encoding="utf-8",
     )
     malformed = diagnostics._maintainer_check(mcp_config)
-    assert malformed["status"] == "unknown"
+    assert malformed["status"] == "not_exposed"
     assert "AI_MEMORY_MAINTAINER" not in json.dumps(malformed)
 
 
-def test_diagnostics_warns_when_maintainer_actions_are_disabled(tmp_path, monkeypatch):
+def test_diagnostics_does_not_warn_for_unexposed_maintainer_actions(tmp_path, monkeypatch):
     """Не помечает готовой установку, где MCP не может менять статусы знаний и Skills."""
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (4)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
     hook_config = tmp_path / "hooks.json"
     _write_hook_config(hook_config)
     mcp_config = tmp_path / "config.toml"
@@ -434,11 +438,11 @@ def test_diagnostics_warns_when_maintainer_actions_are_disabled(tmp_path, monkey
         mcp_config_path=mcp_config,
     )
 
-    assert disabled["overall"] == "warning"
+    assert disabled["overall"] == "ok"
     assert disabled["database"]["status"] == "ok"
     assert disabled["hooks"]["status"] == "ok"
     assert disabled["hook_log"]["status"] == "ok"
-    assert disabled["maintainer_actions"]["status"] == "not_configured"
+    assert disabled["maintainer_actions"]["status"] == "not_exposed"
     assert disabled["memory_mcp"]["status"] == "configured"
 
     monkeypatch.setenv("AI_MEMORY_MAINTAINER", "doctor-only-owner")
@@ -448,8 +452,8 @@ def test_diagnostics_warns_when_maintainer_actions_are_disabled(tmp_path, monkey
         hook_log_path=hook_log,
         mcp_config_path=mcp_config,
     )
-    assert inherited["overall"] == "warning"
-    assert inherited["maintainer_actions"]["status"] == "inherited"
+    assert inherited["overall"] == "ok"
+    assert inherited["maintainer_actions"]["status"] == "not_exposed"
     assert "doctor-only-owner" not in json.dumps(inherited)
 
     monkeypatch.delenv("AI_MEMORY_MAINTAINER", raising=False)
@@ -494,7 +498,7 @@ def test_read_only_database_check_creates_no_wal_sidecars(tmp_path):
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (4)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
     before = {path.name for path in tmp_path.iterdir()}
 
     report = diagnostics._database_check(database)
@@ -510,7 +514,7 @@ def test_active_wal_is_skipped_without_touching_database(tmp_path):
     connection = sqlite3.connect(database)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-    connection.execute("INSERT INTO schema_migrations VALUES (4)")
+    connection.execute("INSERT INTO schema_migrations VALUES (5)")
     connection.commit()
     wal_path = tmp_path / "active-memory.db-wal"
     assert wal_path.stat().st_size > 0
@@ -696,7 +700,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     database = tmp_path / "memory.db"
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute("CREATE TABLE schema_migrations (version INTEGER NOT NULL)")
-        connection.execute("INSERT INTO schema_migrations VALUES (4)")
+        connection.execute("INSERT INTO schema_migrations VALUES (5)")
     codex_home = tmp_path / ".codex"
     codex_home.mkdir()
     hook_config = codex_home / "hooks.json"
@@ -722,6 +726,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     }), encoding="utf-8")
 
     monkeypatch.setattr(storage, "DATABASE_PATH", database)
+    monkeypatch.setenv("AI_MEMORY_DB", str(database))
     monkeypatch.setattr(codex_hooks, "_log_path", lambda: hook_log)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.delenv("CODEX_HOME", raising=False)
@@ -730,7 +735,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert cli.main(["doctor", "--json"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["overall"] == "warning"
-    assert report["maintainer_actions"]["status"] == "not_configured"
+    assert report["maintainer_actions"]["status"] == "not_exposed"
     assert report["hooks"]["metadata_mismatch_events"] == ["Stop"]
     assert report["hooks"]["handler_metadata"]["Stop"] == {
         "timeout_matches_expected": True,
@@ -740,7 +745,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert report["hook_log"]["stale_source_events"] == ["Stop"]
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
-    assert "Решения maintainer: отключены" in output
+    assert "not_exposed" in output
     assert "последнего наблюдавшегося запуска" in output
     assert "не доказывает, что текущая настройка устарела" in output
     assert "Параметры обработчиков требуют обновления: Stop" in output

@@ -1,4 +1,4 @@
-"""Изолированные проверки command hooks Codex."""
+""Изолированные проверки command hooks Codex."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ def isolated_db(tmp_path, monkeypatch):
     """Направляет операции hook в одноразовую SQLite-базу."""
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(storage, "DATABASE_PATH", tmp_path / "hooks.sqlite")
+    monkeypatch.setenv("AI_MEMORY_DB", str(storage.DATABASE_PATH))
     monkeypatch.setenv("AI_MEMORY_HOOK_LOG", str(tmp_path / "hooks.jsonl"))
     storage.init_database()
     return storage.DATABASE_PATH
@@ -63,6 +64,7 @@ def test_prompt_hook_does_not_create_or_migrate_a_missing_database(tmp_path, mon
     database = tmp_path / "missing.sqlite"
     hook_log = tmp_path / "hooks.jsonl"
     monkeypatch.setattr(storage, "DATABASE_PATH", database)
+    monkeypatch.setenv("AI_MEMORY_DB", str(database))
     monkeypatch.setenv("AI_MEMORY_HOOK_LOG", str(hook_log))
 
     output = codex_hooks.handle_event("UserPromptSubmit", {"prompt": "hello"})

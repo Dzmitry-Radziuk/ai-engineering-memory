@@ -1,4 +1,4 @@
-"""Командный интерфейс локальной платформы памяти."""
+""Командный интерфейс локальной платформы памяти."""
 
 from __future__ import annotations
 
@@ -10,6 +10,80 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ai_engineering_memory import storage
+from ai_engineering_memory.application import MemoryService
+from ai_engineering_memory.bootstrap import (
+    create_admin_service,
+    create_learning_service,
+    create_memory_service,
+    create_skills_service,
+)
+
+
+def _memory_service() -> MemoryService:
+    """Создаёт сервис для текущего изолированного запуска CLI."""
+    return create_memory_service()
+
+
+def _configure_redirected_output() -> None:
+    """Использует UTF-8 для перенаправленного вывода CLI в Windows PowerShell."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        encoding = (getattr(stream, "encoding", None) or "").replace("_", "-").lower()
+        if stream.isatty() or encoding == "utf-8":
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
+def _confirm_admin_action(expected: str, *, ask=None) -> bool:
+    """Требует интерактивный exact-match перед human-admin изменением."""
+    if not sys.stdin.isatty():
+        raise ValueError("Привилегированное действие доступно только в интерактивном терминале")
+    ask = ask or input
+    received = ask(f"Для подтверждения введите {expected}: ").strip()
+    if received != expected:
+        print("Подтверждение не совпало; изменений нет.")
+        return False
+    return True
+
+
+def _run_admin(args: argparse.Namespace) -> int:
+    """Выполняет human-admin решение после интерактивного exact confirmation."""
+    service = create_admin_service()
+    if args.admin_domain == "knowledge":
+        action = args.admin_action
+        knowledge_id = args.id
+        if not _confirm_admin_action(f"{action.upper()} {knowledge_id}"):
+            return 1
+        if action == "approve":
+            result = service.approve_knowledge(knowledge_id)
+        elif action == "reject":
+            result = service.reject_knowledge(knowledge_id, reason=args.reason)
+        else:
+            result = service.deprecate_knowledge(knowledge_id)
+    else:
+        maintainer = os.environ.get("AI_MEMORY_MAINTAINER", "")
+        if args.admin_action == "rollback":
+            target = f"{args.skill_name}@{args.version}"
+            if not _confirm_admin_action(f"ROLLBACK {target}"):
+                return 1
+            result = service.rollback_skill_version(
+                args.skill_name, args.version, maintainer=maintainer,
+            )
+        else:
+            action = args.admin_action
+            if not _confirm_admin_action(f"{action.upper()} {args.proposal_id}"):
+                return 1
+            result = service.decide_skill_proposal(
+                args.proposal_id,
+                decision="approved" if action == "approve" else "rejected",
+                maintainer=maintainer,
+                reason=getattr(args, "reason", ""),
+            )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -22,7 +96,7 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", help="вывести машинно-читаемый отчёт")
     doctor.add_argument(
         "--probe-mcp", action="store_true",
-        help="запустить MCP и проверить initialize/tools/list без вызова инструментов",
+        help="запустить MCP и вызвать безопасный memory_search на временной БД",
     )
     doctor.add_argument(
         "--cwd", type=Path, default=Path.cwd(),
@@ -40,6 +114,31 @@ def _parser() -> argparse.ArgumentParser:
     install_hooks.add_argument("--dry-run", action="store_true", help="показать, потребуется ли изменение")
     backup = commands.add_parser("backup", help="создать резервную копию базы")
     backup.add_argument("destination", type=Path)
+    restore = commands.add_parser("restore", help="восстановить базу из резервной копии")
+    restore.add_argument("source", type=Path)
+    admin = commands.add_parser("admin", help="human-only lifecycle actions")
+    admin_commands = admin.add_subparsers(dest="admin_domain", required=True)
+    admin_knowledge = admin_commands.add_parser("knowledge")
+    admin_knowledge_actions = admin_knowledge.add_subparsers(
+        dest="admin_action", required=True,
+    )
+    for action in ("approve", "reject", "deprecate"):
+        admin_action = admin_knowledge_actions.add_parser(action)
+        admin_action.add_argument("id", type=int)
+        if action == "reject":
+            admin_action.add_argument("--reason", required=True)
+    admin_skills = admin_commands.add_parser("skill")
+    admin_skill_actions = admin_skills.add_subparsers(
+        dest="admin_action", required=True,
+    )
+    for action in ("approve", "reject"):
+        admin_action = admin_skill_actions.add_parser(action)
+        admin_action.add_argument("proposal_id")
+        if action == "reject":
+            admin_action.add_argument("--reason", required=True)
+    rollback = admin_skill_actions.add_parser("rollback")
+    rollback.add_argument("skill_name")
+    rollback.add_argument("version")
     knowledge = commands.add_parser("knowledge")
     sub = knowledge.add_subparsers(dest="action", required=True)
     listing = sub.add_parser("list")
@@ -63,6 +162,8 @@ def _parser() -> argparse.ArgumentParser:
     for action in ("approve", "reject", "deprecate"):
         item = sub.add_parser(action)
         item.add_argument("id", type=int)
+        if action == "reject":
+            item.add_argument("--reason")
     skills = commands.add_parser("skills")
     skill_commands = skills.add_subparsers(dest="action", required=True)
     skill_commands.add_parser("list")
@@ -128,12 +229,12 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
     from ai_engineering_memory import learning
 
     ask = ask or input
+    memory_service = _memory_service()
+    admin_service = create_admin_service()
     project_namespace = learning.project_namespace(cwd)
-    candidates = storage.list_knowledge(
-        status="candidate", namespace="global", limit=limit,
-    )
-    project_candidates = storage.list_knowledge(
-        status="candidate", namespace=project_namespace, limit=limit,
+    candidates = memory_service.list_candidates(namespace="global", limit=limit)
+    project_candidates = memory_service.list_candidates(
+        namespace=project_namespace, limit=limit,
     )
     candidates.extend(project_candidates)
     candidates.sort(key=lambda item: (item["namespace"] != "global", -item["id"]))
@@ -160,7 +261,7 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
         )
         _print_untrusted_block("Название кандидата", item["title"])
         _print_untrusted_block("Содержание кандидата", item["content"])
-        evidence_rows = storage.get_knowledge_evidence(knowledge_id)
+        evidence_rows = memory_service.get_evidence(knowledge_id)
         for evidence in evidence_rows:
             _print_untrusted_block(
                 f"Доказательство ({_safe_terminal_text(evidence['kind'])})",
@@ -171,7 +272,7 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
             if evidence["limitations"]:
                 _print_untrusted_block("Ограничения", evidence["limitations"])
         if item["source_type"] == "cross_project_learning":
-            support = storage.get_learning_corroboration(knowledge_id)
+            support = memory_service.get_corroboration(knowledge_id)
             print(
                 "Независимые отпечатки проектов: "
                 f"{support['independent_project_count']}; старые подтверждения "
@@ -188,7 +289,7 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
             if ask(f"Для утверждения введи APPROVE {knowledge_id}: ").strip() != f"APPROVE {knowledge_id}":
                 print("Подтверждение не совпало; кандидат не изменён.")
                 continue
-            saved = storage.approve_knowledge(knowledge_id)
+            saved = admin_service.approve_knowledge(knowledge_id)
             print(f"Запись {knowledge_id}: {saved['status']}.")
             continue
         if choice in {"r", "reject", "отклонить"}:
@@ -199,20 +300,20 @@ def _review_candidates(cwd: Path, *, limit: int, ask=None) -> int:
             if not reason:
                 print("Без причины кандидат не изменён.")
                 continue
-            saved = storage.reject_knowledge(knowledge_id, reason=reason)
+            saved = admin_service.reject_knowledge(knowledge_id, reason=reason)
             print(f"Запись {knowledge_id}: {saved['status']}.")
             continue
         print("Неизвестное действие; кандидат не изменён.")
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def _main(argv: Sequence[str] | None = None) -> int:
     """Выполняет команду и печатает результат в JSON или текстовом виде."""
     args = _parser().parse_args(argv)
     try:
         if args.command == "init":
             storage.init_database()
-            print(f"База готова: {storage.DATABASE_PATH}")
+            print(f"База готова: {storage.current_database_path()}")
         elif args.command == "project-config":
             from ai_engineering_memory import learning
 
@@ -254,7 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 for directory in project_directories
             ]
             report = diagnostics.collect_diagnostics(
-                database_path=storage.DATABASE_PATH,
+                database_path=storage.current_database_path(),
                 hooks_config_path=codex_home / "hooks.json",
                 hook_log_path=codex_hooks._log_path(),
                 mcp_config_path=codex_home / "config.toml",
@@ -327,13 +428,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.probe_mcp and memory_mcp.get("protocol_probe_status") == "verified":
                     print(
                         f"  MCP initialize/tools/list: OK · инструментов: "
-                        f"{memory_mcp['protocol_probe_tool_count']}; бизнес-инструменты не вызывались."
+                        f"{memory_mcp['protocol_probe_tool_count']}; "
+                        "memory_search на временной пустой БД: OK."
                     )
                 elif args.probe_mcp:
                     probe_messages = {
                         "unsafe_command_skipped": "команда запуска не распознана; процесс не запускался",
                         "unsupported_environment_skipped": "есть переменные окружения вне AI Engineering Memory; процесс не запускался",
                         "timeout": "сервер не ответил за отведённое время",
+                        "tool_call_error": "MCP запустился, но безопасный вызов memory_search завершился ошибкой",
                         "incompatible_server": "ответил сервер без ожидаемых инструментов",
                         "launcher_unavailable": "исполняемый файл не найден",
                         "disabled": "сервер выключен в конфигурации",
@@ -405,13 +508,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "или прошла ли проверка."
                             )
                 maintainer_actions = report["maintainer_actions"]
-                state = {
-                    "configured": "настроены",
-                    "inherited": "не подтверждены для MCP",
-                    "not_configured": "отключены",
-                    "unknown": "не удалось проверить",
-                }.get(maintainer_actions["status"], "неизвестно")
-                print(f"Решения maintainer: {state}")
+                print(f"Привилегированные операции MCP: {maintainer_actions['status']}")
             return 0 if report["overall"] == "ok" else 1
         elif args.command == "hooks":
             from ai_engineering_memory import hook_install
@@ -421,35 +518,74 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "status":
-            entries = storage.list_knowledge(limit=500)
-            print(json.dumps({"database": str(storage.DATABASE_PATH), "knowledge": len(entries),
-                              "skills": len(storage.list_skills())}, ensure_ascii=False, indent=2))
+            entries = _memory_service().list_knowledge(limit=500)
+            print(json.dumps({"database": str(storage.current_database_path()), "knowledge": len(entries),
+                              "skills": len(create_skills_service().list_skills())}, ensure_ascii=False, indent=2))
         elif args.command == "backup":
             print(storage.backup_database(args.destination))
+        elif args.command == "restore":
+            source = args.source.expanduser().resolve()
+            destination = storage.current_database_path().resolve()
+            expected = f"RESTORE {source} -> {destination}"
+            print("Перед восстановлением остановите Codex/MCP и другие процессы, использующие эту базу.")
+            if not _confirm_admin_action(expected):
+                return 1
+            result = storage.restore_database(source)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        elif args.command == "admin":
+            return _run_admin(args)
         elif args.command == "knowledge":
             if args.action == "list":
-                result = storage.list_knowledge(status=args.status, namespace=args.namespace, limit=args.limit)
+                result = _memory_service().list_knowledge(
+                    status=args.status, namespace=args.namespace, limit=args.limit,
+                )
             elif args.action == "search":
-                result = storage.search_knowledge(args.query, status=None if args.status == "all" else args.status,
-                                                  namespace=args.namespace, limit=args.limit)
+                result = _memory_service().search(
+                    args.query,
+                    status=None if args.status == "all" else args.status,
+                    namespace=args.namespace,
+                    limit=args.limit,
+                )
             elif args.action == "review":
                 if not sys.stdin.isatty():
                     raise ValueError("Интерактивный review доступен только в терминале")
                 return _review_candidates(args.cwd, limit=args.limit)
             elif args.action == "add":
-                result = storage.create_knowledge(args.category,args.title,args.content,
-                                                  technology=args.technology,namespace=args.namespace)
+                result = _memory_service().create_candidate(
+                    args.category,
+                    args.title,
+                    args.content,
+                    technology=args.technology,
+                    namespace=args.namespace,
+                )
+            elif args.action in {"approve", "reject", "deprecate"}:
+                if not _confirm_admin_action(f"{args.action.upper()} {args.id}"):
+                    return 1
+                admin_service = create_admin_service()
+                if args.action == "approve":
+                    result = admin_service.approve_knowledge(args.id)
+                elif args.action == "reject":
+                    reason = args.reason or input("Причина отклонения (обязательна): ").strip()
+                    result = admin_service.reject_knowledge(args.id, reason=reason)
+                else:
+                    result = admin_service.deprecate_knowledge(args.id)
             else:
-                result = getattr(storage, f"{args.action}_knowledge")(args.id)
+                raise ValueError("Неизвестное действие с knowledge")
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         elif args.command == "skills":
-            result = storage.list_skills() if args.action == "list" else storage.list_skill_proposals(args.status)
+            skills_service = create_skills_service()
+            result = (
+                skills_service.list_skills()
+                if args.action == "list"
+                else skills_service.list_proposals(args.status)
+            )
             print(json.dumps(result, ensure_ascii=False, indent=2))
         elif args.command == "learning":
             from ai_engineering_memory import learning
 
+            learning_service = create_learning_service()
             if args.action == "status":
-                summary = storage.learning_status_summary()
+                summary = learning_service.status_summary()
                 summary["codex_native_capture"] = {
                     "mode": "best_effort",
                     "requires": "UserPromptSubmit hook, Codex model, and learning_add_candidate MCP tool",
@@ -471,23 +607,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     summary["legacy_manual_analysis_available"] = False
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
             elif args.action == "list":
-                print(json.dumps(storage.list_learning_events(limit=args.limit),
+                print(json.dumps(learning_service.list_events(limit=args.limit),
                                  ensure_ascii=False, indent=2))
             elif args.action == "attempts":
-                print(json.dumps(storage.list_verification_attempts(
+                print(json.dumps(learning_service.list_attempts(
                     limit=args.limit, failed_only=not args.all,
                 ), ensure_ascii=False, indent=2))
             elif args.action == "process":
-                print(json.dumps(learning.process_pending(limit=args.limit),
+                print(json.dumps(learning_service.process_pending(limit=args.limit),
                                  ensure_ascii=False, indent=2))
             elif args.action == "retry":
-                storage.retry_learning_event(args.event_id)
+                learning_service.retry_event(args.event_id)
                 print(json.dumps({"event_id": args.event_id, "status": "pending_analysis"}))
             elif args.action == "verify":
                 command = list(args.program_argv)
                 if command and command[0] == "--":
                     command.pop(0)
-                result = learning.verify_command(
+                result = learning_service.verify_command(
                     args.task_id, args.summary, command, cwd=args.cwd,
                     timeout=args.timeout, changed_files=args.changed_file,
                 )
@@ -495,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if not result["process_succeeded"]:
                     return 1
             elif args.action == "withdraw":
-                result = storage.withdraw_learning_candidate(
+                result = learning_service.withdraw_candidate(
                     args.knowledge_id, reason=args.reason
                 )
                 print(json.dumps({"id": result["id"], "status": result["status"]},
@@ -507,6 +643,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (storage.StorageError, OSError, TypeError, ValueError, RuntimeError) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 2
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Создаёт Settings/Database для запуска CLI и изолирует его операции."""
+    _configure_redirected_output()
+    store = storage.create_storage()
+    with store.activate():
+        return _main(argv)
 
 
 if __name__ == "__main__":

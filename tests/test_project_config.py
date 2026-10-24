@@ -1,4 +1,4 @@
-"""Проверки безопасной генерации проектной конфигурации Codex."""
+""Проверки безопасной генерации проектной конфигурации Codex."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ def test_project_config_prints_valid_scoped_mcp_settings_without_writes(
     project_root.mkdir()
     database_path = tmp_path / "must-not-be-created.sqlite"
     monkeypatch.setattr(storage, "DATABASE_PATH", database_path)
+    monkeypatch.setenv("AI_MEMORY_DB", str(database_path))
 
     assert cli.main(["project-config", "--cwd", str(project_root)]) == 0
 

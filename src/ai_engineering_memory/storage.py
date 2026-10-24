@@ -1,8 +1,9 @@
-"""Локальное хранилище знаний, событий и предложений Skills."""
+""Локальное хранилище знаний, событий и предложений Skills."""
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -10,28 +11,29 @@ import sqlite3
 import tempfile
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from ai_engineering_memory import migrations
+from ai_engineering_memory.database import (
+    Database,
+    active_database,
+    current_database,
+    use_database,
+)
+from ai_engineering_memory.settings import Settings
+
 BASE_DIR = Path(__file__).resolve().parents[2]
 DATA_DIR = BASE_DIR / "data"
-_configured_database = os.environ.get("AI_MEMORY_DB")
-if _configured_database:
-    DATABASE_PATH = Path(_configured_database).expanduser()
-elif (DATA_DIR / "memory.db").exists():
-    DATABASE_PATH = DATA_DIR / "memory.db"
-elif os.environ.get("LOCALAPPDATA"):
-    DATABASE_PATH = Path(os.environ["LOCALAPPDATA"]) / "AIEngineeringMemory" / "memory.db"
-else:
-    DATABASE_PATH = Path.home() / ".local" / "share" / "AIEngineeringMemory" / "memory.db"
-if not DATABASE_PATH.is_absolute():
-    raise ValueError("AI_MEMORY_DB должен быть абсолютным путём")
+DATABASE_PATH = Settings.from_environment(repository_data_dir=DATA_DIR).database_path
+LATEST_SCHEMA_VERSION = migrations.LATEST_SCHEMA_VERSION
+_fts_unavailable = migrations.fts_unavailable
 MAX_TEXT_LENGTH = 100_000
 STATUSES = {"candidate", "approved", "rejected", "deprecated"}
 MAX_LEARNING_ATTEMPTS = 3
-LATEST_SCHEMA_VERSION = 4
 _SENSITIVE_SECRET_PATTERNS = (
     r"(?i)\b(api[_-]?key|token|password|secret|authorization)\s*[:=]\s*\S+",
     r"(?i)\bbearer\s+\S+",
@@ -62,236 +64,64 @@ def require_maintainer(maintainer: str) -> str:
     return configured
 
 
+def current_database_path() -> Path:
+    """Возвращает путь БД текущего вызова с поддержкой legacy default."""
+    return current_database(DATABASE_PATH).path
+
+
 @contextmanager
 def _connect(*, read_only: bool = False, timeout: float = 10.0) -> Iterator[sqlite3.Connection]:
     """Открывает изолированное соединение с локальной базой."""
-    if read_only:
-        uri = DATABASE_PATH.resolve().as_uri() + "?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=timeout)
-    else:
-        connection = sqlite3.connect(DATABASE_PATH, timeout=timeout)
-    try:
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))}")
-        with connection:
-            yield connection
-    finally:
-        connection.close()
+    database = current_database(DATABASE_PATH)
+    with database.connect(read_only=read_only, timeout=timeout) as connection:
+        yield connection
+
+
+class Storage:
+    """Совместимый storage facade, привязанный к одному Database instance."""
+
+    def __init__(self, database: Database):
+        """Создаёт facade без открытия соединения и изменения схемы."""
+        self.database = database
+
+    @property
+    def database_path(self) -> Path:
+        """Возвращает неизменяемый путь базы этого facade."""
+        return self.database.path
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        """Активирует базу для группы операций, сохраняя изоляцию контекста."""
+        with use_database(self.database):
+            yield
+
+    def __getattr__(self, name: str):
+        """Вызывает legacy storage API внутри изолированного database context."""
+        function = globals().get(name)
+        if name.startswith("_") or not inspect.isfunction(function):
+            raise AttributeError(name)
+
+        @wraps(function)
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            with use_database(self.database):
+                return function(*args, **kwargs)
+
+        return invoke
+
+
+def create_storage(settings: Settings | None = None) -> Storage:
+    """Создаёт storage facade с явно заданными или вычисленными настройками."""
+    if settings is None and (database := active_database()) is not None:
+        return Storage(database)
+    resolved = settings or Settings.from_environment(repository_data_dir=DATA_DIR)
+    return Storage(Database(resolved.database_path))
 
 
 def init_database() -> None:
-    """Инициализирует базу и безопасно добавляет недостающие поля."""
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    """????????? ??????????? versioned migrations; latest schema ???????? ??? DDL."""
+    current_database_path().parent.mkdir(parents=True, exist_ok=True)
     with _connect() as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS knowledge (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category TEXT NOT NULL,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'candidate',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )"""
-        )
-        existing = {r["name"] for r in connection.execute("PRAGMA table_info(knowledge)")}
-        additions = {
-            "uuid": "TEXT",
-            "source_type": "TEXT NOT NULL DEFAULT 'manual'",
-            "source_reference": "TEXT",
-            "technology": "TEXT NOT NULL DEFAULT ''",
-            "confidence": "REAL NOT NULL DEFAULT 0.5",
-            "namespace": "TEXT NOT NULL DEFAULT 'global'",
-            "updated_at": "TEXT",
-            "approved_at": "TEXT",
-            "publishable": "INTEGER NOT NULL DEFAULT 0",
-            "content_hash": "TEXT",
-        }
-        for name, definition in additions.items():
-            if name not in existing:
-                connection.execute(f"ALTER TABLE knowledge ADD COLUMN {name} {definition}")
-        for row in connection.execute("SELECT id FROM knowledge WHERE uuid IS NULL"):
-            connection.execute("UPDATE knowledge SET uuid=? WHERE id=?", (str(uuid.uuid4()), row["id"]))
-        connection.execute("UPDATE knowledge SET updated_at = created_at WHERE updated_at IS NULL")
-        for row in connection.execute(
-            "SELECT id,category,title,content FROM knowledge WHERE content_hash IS NULL"
-        ):
-            digest = hashlib.sha256(
-                (row["category"].lower() + "\0" + row["title"].lower() + "\0" + row["content"].lower()).encode()
-            ).hexdigest()
-            connection.execute("UPDATE knowledge SET content_hash=? WHERE id=?", (digest, row["id"]))
-        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_uuid ON knowledge(uuid)")
-        connection.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_scope ON knowledge(namespace, status)")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                knowledge_id INTEGER NOT NULL REFERENCES knowledge(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL, result TEXT NOT NULL, source TEXT NOT NULL DEFAULT '',
-                checked_at TEXT NOT NULL, limitations TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL
-            )"""
-        )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS task_events (
-                event_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL,
-                client_name TEXT NOT NULL, task_description TEXT NOT NULL,
-                changed_files TEXT NOT NULL, test_results TEXT NOT NULL,
-                outcome TEXT NOT NULL, completed_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending_analysis', analysis TEXT,
-                verification_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
-                locked_at TEXT, next_attempt_at TEXT, last_error_type TEXT,
-                analyzed_at TEXT, project_fingerprint TEXT
-            )"""
-        )
-        task_event_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(task_events)")
-        }
-        for name, definition in {
-            "verification_id": "TEXT",
-            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-            "locked_at": "TEXT",
-            "next_attempt_at": "TEXT",
-            "last_error_type": "TEXT",
-            "analyzed_at": "TEXT",
-            "project_fingerprint": "TEXT",
-        }.items():
-            if name not in task_event_columns:
-                connection.execute(f"ALTER TABLE task_events ADD COLUMN {name} {definition}")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS verification_records (
-                verification_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
-                task_id TEXT NOT NULL, verification_type TEXT NOT NULL,
-                exit_code INTEGER NOT NULL, started_at TEXT NOT NULL,
-                completed_at TEXT NOT NULL, artifact_digest TEXT NOT NULL,
-                command_digest TEXT NOT NULL, verifier TEXT NOT NULL,
-                trust_status TEXT NOT NULL, project_fingerprint TEXT
-            )"""
-        )
-        verification_columns = {
-            row["name"] for row in connection.execute(
-                "PRAGMA table_info(verification_records)"
-            )
-        }
-        if "project_fingerprint" not in verification_columns:
-            connection.execute(
-                "ALTER TABLE verification_records ADD COLUMN project_fingerprint TEXT"
-            )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS learning_event_audit (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL,
-                knowledge_id INTEGER, action TEXT NOT NULL, status_from TEXT,
-                status_to TEXT, occurred_at TEXT NOT NULL, details TEXT NOT NULL DEFAULT '{}'
-            )"""
-        )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS learning_corroborations (
-                global_knowledge_id INTEGER NOT NULL REFERENCES knowledge(id) ON DELETE CASCADE,
-                project_knowledge_id INTEGER REFERENCES knowledge(id) ON DELETE SET NULL,
-                project_namespace TEXT NOT NULL,
-                event_id TEXT NOT NULL REFERENCES task_events(event_id) ON DELETE CASCADE,
-                verification_id TEXT NOT NULL REFERENCES verification_records(verification_id) ON DELETE CASCADE,
-                created_at TEXT NOT NULL, project_fingerprint TEXT,
-                PRIMARY KEY(global_knowledge_id, project_namespace)
-            )"""
-        )
-        corroboration_columns = {
-            row["name"] for row in connection.execute(
-                "PRAGMA table_info(learning_corroborations)"
-            )
-        }
-        if "project_fingerprint" not in corroboration_columns:
-            connection.execute(
-                "ALTER TABLE learning_corroborations ADD COLUMN project_fingerprint TEXT"
-            )
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_corroboration_project_fingerprint "
-            "ON learning_corroborations(global_knowledge_id, project_fingerprint) "
-            "WHERE project_fingerprint IS NOT NULL"
-        )
-        legacy_unverified = connection.execute(
-            "SELECT event_id,status FROM task_events WHERE verification_id IS NULL "
-            "AND status IN ('pending_analysis','processing','retryable_error','permanent_error')"
-        ).fetchall()
-        migration_time = datetime.now(UTC).isoformat()
-        for row in legacy_unverified:
-            connection.execute(
-                "INSERT INTO learning_event_audit "
-                "(event_id,action,status_from,status_to,occurred_at,details) "
-                "VALUES(?,?,?,?,?,?)",
-                (row["event_id"], "legacy_event_requires_verification", row["status"],
-                 "waiting_for_verification", migration_time,
-                 json.dumps({"reason": "no_trusted_verification_record"})),
-            )
-        connection.execute(
-            "UPDATE task_events SET status='waiting_for_verification',locked_at=NULL "
-            "WHERE verification_id IS NULL AND status IN "
-            "('pending_analysis','processing','retryable_error','permanent_error')"
-        )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS skill_proposals (
-                id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, proposer TEXT NOT NULL,
-                change_description TEXT NOT NULL, proposed_content TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'candidate', created_at TEXT NOT NULL,
-                decided_at TEXT, decision_by TEXT, decision_reason TEXT
-            )"""
-        )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS skill_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL,
-                version TEXT NOT NULL, content TEXT NOT NULL, changelog TEXT NOT NULL,
-                previous_version TEXT, proposal_id TEXT, validation_result TEXT NOT NULL,
-                created_at TEXT NOT NULL, UNIQUE(skill_name, version)
-            )"""
-        )
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-            )"""
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
-        connection.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
-        try:
-            connection.execute(
-                """CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_fts USING fts5(
-                    title, content, category, technology, content='knowledge', content_rowid='id'
-                )"""
-            )
-            connection.executescript(
-                """CREATE TRIGGER IF NOT EXISTS knowledge_ai AFTER INSERT ON knowledge BEGIN
-                    INSERT INTO knowledge_fts(rowid,title,content,category,technology)
-                    VALUES(new.id,new.title,new.content,new.category,new.technology);
-                END;
-                CREATE TRIGGER IF NOT EXISTS knowledge_ad AFTER DELETE ON knowledge BEGIN
-                    INSERT INTO knowledge_fts(knowledge_fts,rowid,title,content,category,technology)
-                    VALUES('delete',old.id,old.title,old.content,old.category,old.technology);
-                END;
-                CREATE TRIGGER IF NOT EXISTS knowledge_au AFTER UPDATE ON knowledge BEGIN
-                    INSERT INTO knowledge_fts(knowledge_fts,rowid,title,content,category,technology)
-                    VALUES('delete',old.id,old.title,old.content,old.category,old.technology);
-                    INSERT INTO knowledge_fts(rowid,title,content,category,technology)
-                    VALUES(new.id,new.title,new.content,new.category,new.technology);
-                END;"""
-            )
-            connection.execute(
-                "INSERT INTO knowledge_fts(knowledge_fts) VALUES ('rebuild')"
-            )
-        except sqlite3.OperationalError:
-            # LIKE fallback остаётся доступным, если сборка SQLite без FTS5.
-            pass
+        migrations.MigrationEngine().apply(connection)
 
 
 def _validate_text(value: str, field: str, maximum: int = MAX_TEXT_LENGTH) -> str:
@@ -508,7 +338,7 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
                      _read_only: bool = False) -> list[dict[str, Any]]:
     """Ищет знания через FTS5 с безопасным резервным поиском LIKE."""
     if _read_only:
-        if not DATABASE_PATH.is_file():
+        if not current_database_path().is_file():
             return []
     else:
         init_database()
@@ -577,8 +407,9 @@ def search_knowledge(query: str, *, category: str | None = None, technology: str
                     if len(matches) >= limit:
                         break
                 return matches[:limit]
-            except sqlite3.OperationalError:
-                pass
+            except sqlite3.OperationalError as exc:
+                if not _fts_unavailable(exc):
+                    raise
         if prompt_context:
             escaped_tokens = [
                 token.replace("!", "!!").replace("%", "!%").replace("_", "!_")
@@ -1645,18 +1476,89 @@ def import_knowledge(payload: dict[str, Any], *, namespace: str = "global") -> l
 
 
 def backup_database(destination: Path) -> Path:
-    """Создаёт согласованную атомарную копию базы через SQLite backup API."""
-    init_database()
+    """Создаёт проверенную атомарную копию базы через SQLite backup API."""
     destination = destination.resolve()
+    source_path = current_database_path().resolve()
+    if destination == source_path:
+        raise StorageError("Путь резервной копии совпадает с активной базой")
+    if not source_path.is_file():
+        raise StorageError(f"Активная база не найдена: {source_path}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_name(destination.name + ".tmp")
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with _connect() as source, sqlite3.connect(temporary) as target:
+        with _connect(read_only=True) as source, closing(sqlite3.connect(temporary)) as target:
             source.backup(target)
+        _validate_database_file(temporary)
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
     return destination
+
+
+def _validate_database_file(path: Path, *, require_current: bool = False) -> None:
+    """Проверяет целостность SQLite-файла и наличие таблицы знаний без записи."""
+    if not path.is_file():
+        raise StorageError(f"Файл базы не найден: {path}")
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            if result is None or result[0] != "ok":
+                raise StorageError(f"Проверка SQLite не пройдена: {result[0] if result else 'нет результата'}")
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge'"
+            ).fetchone()
+            if table is None:
+                raise StorageError("В файле нет таблицы knowledge")
+            if require_current:
+                connection.row_factory = sqlite3.Row
+                if not migrations.MigrationEngine().is_current(connection):
+                    raise StorageError("В файле нет актуальной схемы базы")
+    except sqlite3.DatabaseError as exc:
+        raise StorageError(f"Некорректный файл базы: {exc}") from exc
+
+
+def restore_database(source_path: Path) -> dict[str, str]:
+    """Атомарно восстанавливает активную базу, сохраняя её копию до замены."""
+    source_path = source_path.expanduser().resolve()
+    destination = current_database_path().resolve()
+    if source_path == destination:
+        raise StorageError("Источник восстановления совпадает с активной базой")
+    _validate_database_file(source_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.restore")
+    previous = destination.with_name(
+        f"{destination.stem}.pre-restore-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}{destination.suffix}"
+    )
+    replaced = False
+    try:
+        with closing(sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True)) as source, closing(sqlite3.connect(staged)) as target:
+            source.backup(target)
+        with closing(sqlite3.connect(staged)) as candidate:
+            candidate.row_factory = sqlite3.Row
+            migrations.MigrationEngine().apply(candidate)
+            candidate.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            candidate.execute("PRAGMA journal_mode=DELETE")
+        _validate_database_file(staged, require_current=True)
+        if destination.exists():
+            backup_database(previous)
+        if destination.exists():
+            with _connect() as active:
+                active.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        staged.replace(destination)
+        replaced = True
+        _validate_database_file(destination, require_current=True)
+        return {"database": str(destination), "source": str(source_path), "pre_restore_backup": str(previous) if previous.exists() else ""}
+    except Exception:
+        if replaced:
+            if previous.exists():
+                previous.replace(destination)
+            else:
+                destination.unlink(missing_ok=True)
+        raise
+    finally:
+        staged.unlink(missing_ok=True)
+        Path(str(staged) + "-wal").unlink(missing_ok=True)
+        Path(str(staged) + "-shm").unlink(missing_ok=True)
 
 
 def _skills_root() -> Path:

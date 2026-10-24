@@ -1,6 +1,6 @@
-# Архитектура
+ Архитектура
 
-Проект — локальный модульный монолит: CLI и MCP являются адаптерами, а правила и SQLite persistence принадлежат ядру. `storage.py` открывает отдельное SQLite-соединение на операцию, включает foreign keys, busy timeout и WAL. Расширения схемы выполняются повторяемой миграцией; существующие строки и ID не удаляются.
+Проект — локальный модульный монолит: CLI и MCP являются адаптерами, а правила и SQLite persistence принадлежат ядру. `storage.py` открывает отдельное SQLite-соединение на операцию, включает foreign keys, busy timeout и WAL. `MigrationEngine` последовательно применяет версии схемы 1–5 отдельными повторяемыми транзакциями; обычный запуск актуальной схемы проверяет версию и обязательные поля и не выполняет DDL или FTS rebuild. Существующие строки и ID сохраняются.
 
 ```text
 Codex UserPromptSubmit ──> approved search + selective learning instruction
@@ -10,8 +10,13 @@ Codex model ────────────> MCP learning_add_candidate
 second verified project ───────────────────────────> global candidate + corroborations
 maintainer approval ───────────────────────────────> approved global retrieval
 Codex Stop ──────────────> metadata-only hook log; no learning write
-CLI / MCP ──────────────> deterministic storage ──> SQLite
+CLI ────────────────────> compatibility storage ──> SQLite
+MCP knowledge tools ────> MemoryService ──> KnowledgeRepository ──> SQLite adapter
 ```
+
+Операции с основной базой знаний постепенно переводятся на слои `MemoryService` → `KnowledgeRepository` → `SqliteKnowledgeRepository`. CLI и MCP используют сервис для поиска, обзора, чтения, перечисления и создания кандидатов; интерактивное утверждение знаний в CLI делегируется отдельному `AdminService`. `LearningService` объединяет CLI-сценарии verifier/очереди с repository и workflow ports, а MCP передаёт ему candidate capture, legacy event ingest и scoped status lookup вместе с разрешёнными namespace. `SkillsService` предоставляет обоим адаптерам чтение и создание proposals; `AdminService` выполняет human-only решения после exact confirmation в интерактивном CLI. Отдельные диагностические и backup-команды ещё используют legacy API напрямую, поэтому миграция ядра не завершена. `Settings` выбирает путь к БД, а контекст `Database` позволяет адаптерам изолировать одновременные вызовы с разными базами в одном процессе.
+
+`UserPromptSubmit` выполняет поиск через `MemoryService` с явным `read_only=True`. Если базы ещё нет, поиск возвращает пустой результат и не создаёт файл; hook может отобразить найденные утверждённые записи, но не меняет схему или данные.
 
 Основные таблицы: `knowledge`, `evidence`, `task_events`, `verification_records`, `learning_event_audit`, `learning_corroborations`, `skill_proposals`, `skill_versions`, `schema_migrations`. Старые методы `init_database`, `add_knowledge`, `get_knowledge` и MCP tool names сохранены. Передача `task_verified` через MCP без существующей успешной локальной verification-записи отклоняется.
 

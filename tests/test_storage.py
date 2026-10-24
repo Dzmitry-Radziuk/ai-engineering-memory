@@ -1,4 +1,4 @@
-"""Тесты локального хранилища на изолированных временных базах."""
+""Тесты локального хранилища на изолированных временных базах."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ def isolated_db(tmp_path, monkeypatch):
     """Перенаправляет хранилище на одноразовую базу теста."""
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(storage, "DATABASE_PATH", tmp_path / "test_memory.db")
+    monkeypatch.setenv("AI_MEMORY_DB", str(storage.DATABASE_PATH))
     return storage.DATABASE_PATH
 
 
@@ -57,6 +58,97 @@ def test_legacy_api_and_safe_migration(isolated_db):
     new_id = storage.add_knowledge("ops", "New", "new content")
     assert new_id == 2
     assert len(storage.get_knowledge()) == 2
+
+
+def test_database_init_does_not_rebuild_existing_fts_index(isolated_db, monkeypatch):
+    """Повторный запуск init сохраняет FTS-индекс без полного перестроения."""
+    storage.init_database()
+    with storage._connect() as connection:
+        fts_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='knowledge_fts'"
+        ).fetchone()
+    if fts_exists is None:
+        pytest.skip("SQLite в этой среде собрана без FTS5")
+
+    statements = []
+    original_connect = storage._connect
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, parameters=()):
+            statements.append(sql)
+            return self.connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def tracking_connect(*, read_only=False, timeout=10.0):
+        with original_connect(read_only=read_only, timeout=timeout) as connection:
+            yield TrackingConnection(connection)
+
+    monkeypatch.setattr(storage, "_connect", tracking_connect)
+    storage.init_database()
+
+    assert not any("VALUES ('rebuild')" in sql for sql in statements)
+
+
+def test_database_init_skips_schema_work_after_latest_migration(isolated_db, monkeypatch):
+    """Актуальная схема пропускает повторный запуск таблиц, индексов и FTS."""
+    storage.init_database()
+    statements = []
+    original_connect = storage._connect
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, parameters=()):
+            statements.append(sql)
+            return self.connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def tracking_connect(*, read_only=False, timeout=10.0):
+        with original_connect(read_only=read_only, timeout=timeout) as connection:
+            yield TrackingConnection(connection)
+
+    monkeypatch.setattr(storage, "_connect", tracking_connect)
+    storage.init_database()
+
+    assert len(statements) == 6
+    assert "sqlite_master" in statements[0]
+    assert "MAX(version)" in statements[1]
+    assert all(statement.startswith("PRAGMA table_info") for statement in statements[2:])
+
+
+def test_schema_migration_five_adds_filter_index_without_losing_data(isolated_db):
+    """Обновляет v4 до v5 без удаления существующих записей."""
+    storage.init_database()
+    item = storage.create_knowledge(
+        "backend", "Preserved", "Existing content", namespace="project:test",
+    )
+    with storage._connect() as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version=5")
+        connection.execute("DROP INDEX idx_knowledge_scope_category")
+
+    storage.init_database()
+
+    with storage._connect() as connection:
+        version = connection.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0]
+        index = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' "
+            "AND name='idx_knowledge_scope_category'"
+        ).fetchone()
+    assert version == storage.LATEST_SCHEMA_VERSION == 5
+    assert index is not None
+    assert storage.get_knowledge(item["id"])["content"] == "Existing content"
 
 
 def test_project_fingerprint_schema_migration_is_repeatable(isolated_db):
@@ -106,8 +198,9 @@ def test_legacy_unverified_queue_events_wait_for_local_verification(isolated_db)
             "(event_id,project_id,task_id,client_name,task_description,changed_files,"
             "test_results,outcome,completed_at,status) "
             "VALUES('legacy-event','project:test','task-legacy','Codex','Old report',"
-            "'[]','{}','Finished','2026-10-22T00:00:00Z','pending_analysis')"
+                "'[]','{}','Finished','2026-10-22T00:00:00Z','pending_analysis')"
         )
+        connection.execute("DELETE FROM schema_migrations WHERE version=5")
     storage.init_database()
     event = storage.get_task_status("legacy-event")
     assert event["status"] == "waiting_for_verification"
@@ -212,6 +305,36 @@ def test_prompt_search_fallback_matches_terms_out_of_order(isolated_db, monkeypa
     )
 
     assert [result["id"] for result in results] == [item["id"]]
+
+
+def test_prompt_search_does_not_hide_corrupted_fts_errors(isolated_db, monkeypatch):
+    """Не маскирует повреждение существующего FTS-индекса под обычный fallback."""
+    item = storage.create_knowledge(
+        "backend", "Retry policy", "Use bounded backoff for transient errors.",
+    )
+    storage.approve_knowledge(item["id"])
+    original_connect = storage._connect
+
+    class CorruptedFtsConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, sql, parameters=()):
+            if "knowledge_fts MATCH" in sql:
+                raise sqlite3.OperationalError("database disk image is malformed")
+            return self.connection.execute(sql, parameters)
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    @contextmanager
+    def connect_with_corrupted_fts(*, read_only=False, timeout=10.0):
+        with original_connect(read_only=read_only, timeout=timeout) as connection:
+            yield CorruptedFtsConnection(connection)
+
+    monkeypatch.setattr(storage, "_connect", connect_with_corrupted_fts)
+    with pytest.raises(sqlite3.OperationalError, match="malformed"):
+        storage.search_knowledge("retry backoff", status="approved")
 
 
 def test_prompt_search_fallback_ranks_by_matching_query_terms(isolated_db, monkeypatch):

@@ -1,4 +1,4 @@
-"""Проверки безопасного терминального обзора кандидатов памяти."""
+""Проверки безопасного терминального обзора кандидатов памяти."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def isolated_db(tmp_path, monkeypatch):
     """Перенаправляет CLI в одноразовую SQLite-базу."""
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(storage, "DATABASE_PATH", tmp_path / "review.sqlite")
+    monkeypatch.setenv("AI_MEMORY_DB", str(storage.DATABASE_PATH))
     storage.init_database()
     return tmp_path
 

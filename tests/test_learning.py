@@ -1,4 +1,4 @@
-"""Изолированные проверки верификации и очереди learning-событий."""
+""Изолированные проверки верификации и очереди learning-событий."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ def isolated_db(tmp_path, monkeypatch):
     """Перенаправляет persistent-слой в одноразовую тестовую SQLite."""
     monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
     monkeypatch.setattr(storage, "DATABASE_PATH", tmp_path / "learning.sqlite")
+    monkeypatch.setenv("AI_MEMORY_DB", str(storage.DATABASE_PATH))
     monkeypatch.delenv("AI_MEMORY_OLLAMA_MODEL", raising=False)
     monkeypatch.delenv("AI_MEMORY_OLLAMA_URL", raising=False)
     storage.init_database()
