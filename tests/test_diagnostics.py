@@ -760,6 +760,7 @@ def test_diagnostics_does_not_echo_untrusted_log_values(tmp_path):
         "source": None,
         "result": None,
         "duration_ms": None,
+        "learning_instruction_injected": None,
         "error_type": None,
     }
     assert report["missing_events"] == ["UserPromptSubmit"]
@@ -964,6 +965,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
                 "source": codex_hooks.HOOK_SOURCE,
                 "result": "success",
                 "duration_ms": 2,
+                "learning_instruction_injected": True,
             },
             {
                 "event": "Stop",
@@ -993,6 +995,9 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
         "status_message_matches_expected": False,
     }
     assert report["hook_log"]["events"]["Stop"]["result"] == "marker_present_unverified"
+    assert report["hook_log"]["events"]["UserPromptSubmit"][
+        "learning_instruction_injected"
+    ] is True
     assert report["hook_log"]["error_count"] == 1
     assert report["hook_log"]["latest_error_events"] == []
     assert report["hook_log"]["stale_source_events"] == ["Stop"]
@@ -1011,6 +1016,7 @@ def test_doctor_cli_emits_json_report_without_initializing_database(
     assert cli.main(["doctor"]) == 1
     output = capsys.readouterr().out
     assert "not_exposed" in output
+    assert "learning_instruction=enabled" in output
     assert (
         "Последний запуск UserPromptSubmit: 2026-10-23T10:00:30+00:00 · "
         "success · ai-engineering-memory:1.5.10 · 2 мс"
