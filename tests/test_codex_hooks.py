@@ -326,6 +326,17 @@ def test_trivial_non_engineering_prompt_gets_no_learning_instructions(isolated_d
     ) == {}
 
 
+def test_learning_instruction_requires_actionable_engineering_intent(isolated_db):
+    """Knowledge questions do not receive task-capture instructions."""
+    for prompt in (
+        "What is code?",
+        "What is an API?",
+        "Tell me what Docker is",
+        "Explain a bug in a story",
+    ):
+        assert codex_hooks.handle_event("UserPromptSubmit", {"prompt": prompt}) == {}
+
+
 def test_general_action_words_need_technical_context_for_learning(isolated_db):
     """Общие глаголы не включают инструкцию обучения без инженерного контекста."""
     for prompt in (
