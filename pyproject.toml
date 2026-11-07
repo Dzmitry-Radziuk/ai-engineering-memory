@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "build==1.6.1",
-    "coverage==7.16.2",
+    "coverage==7.17.2",
     "mypy==2.4.0",
     "pip-audit==2.10.1",
     "pipx==1.13.0",
